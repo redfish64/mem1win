@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.autograd.functional as af
 import logging
 import logging.config
 import argparse
@@ -19,100 +20,109 @@ import gutenberg
 
 #The idea of this project is that we have a long term memory organized in a different way than most do:
 #  [----- mem output -----] [next char(s) pred]
-#     |              \           /
-#    (+)         [ ----- core ----- ]
-#     |              /           \
+#                 \              /
+#         (mem out fn)          /
+#         |        \           /
+#         |    [ ----- core ----- ]
+#         |        /           \
 #  [----- mem input -----] [curr char(s)]
 #
-#  Lets assume a 1 char input window. So, in iteration 1, [mem input] is initialized to zero and included along with [curr char(s)]
-#
-#  Simple 2 iter example:
-#
-#  Iter 1:
-#    Step 1: During forward pass use mem input and curr char to calculate [next char(s) pred] and do back prop.
-#    Step 2:
-#       let mem1_wrt_core1 = the derivative of [mem output] wrt all the weights in [core]
-#
-#  Iter 2:
-#    Step 1: 
-#       let out_wrt_core2 = derivative of [next char(s)] wrt weights in [core]
-#       let out_wrt_mem1 = derivative of [next char(s)] wrt [mem input]
-#       let mem2_wrt_core2 = the derivative of [mem output] wrt weights in [core]
-#       let mem2_wrt_mem1 = the derivative of [mem output] wrt [mem input]
-#       let mem2_wrt_both_cores = mem2_wrt_mem1 * mem1_wrt_core1 + mem2_wrt_core2
-#       let out_wrt_both_cores = out_wrt_mem1 * mem1_wrt_core1 + out_wrt_core2
-#    Step 2:
-#       do backprop
-#    
-#
-#   Full example:
-#     Init:
-#       let last_core_weight_grad = zeros_like(core_weights)
-#       let memin_wrt_last_core = zeros_like(memory)
-#       param c = constant indicating the relationship between distance of core weight and how much
-#                 it effects memory
-#       let memory = registered buffer with grad = true
-#
-#     Step 1: During forward pass use mem input and curr char to calculate [next char(s) pred]
-#     Step 2: Do backprop from output_loss and mem_output at same time
-#                 /\
-#              we can do this by cat'ing the mem_output and the final loss into one tensor. Then
-#              we run backwards against that like catted.backwards(ones_like_catted)
-#              PERF: Not sure if this saves much time, since in the end we still have to calculate
-#              individual gradiants for all memory locations and output.
-#
-#     Step 3:
-#       let curr_core_weight_grad = length (aka absolute val) of gradient of output loss wrt core weight
-#                                                   /\
-#              TODO 2.5: should we really take the length here? If a weight moves forwards and backwards again
-#                        it's grad would be less then if we used length. Maybe more appropriate?
-#       let core_weight_grad = curr_core_weight_grad + last_core_weight_grad
-#       let adj_memin_wrt_lastcore = memin_wrt_lastcore * c / core_weight_grad (for each core weight)
-#                                                              /\
-#             the idea here is that as the fastly moving core weights lose their ability to affect memory
-#       let memout_wrt_all_cores = memout_wrt_core + memout_wrt_memin * adj_memin_wrt_lastcore
-#       let out_wrt_all_cores = out_wrt_core + out_wrt_memin * adj_memin_wrt_lastcore
-#     Step 5:
-#       Save curr_core_weight_diff as last_core_weight_diff for next iter
-#       Save memout_wrt_all_cores as memin_wrt_lastcore
 
 # How this module fits in with everything else:
 #   This will work as a wrapper for another module. It's forward will expect the original
-#   module's input. It will then append the memory to it from the last round.
+#   module's input. It will then append the memory to it from the last round as the first parameter
 #   There will also be a output layer, which will accept the original model's output and generate
 #   changes to memory values for the next round
-
+# TODO add option to loop without consuming input if unsure (only updating memory)
 # How to train with this module:
 #   This module requires batches to be specially arraigned.
 #   Each sample must come after the previous one in sequence according to the work (movie/book/etc.) be processed.
 
+#Note that it uses jacobian which is rather inefficient for this purpose, but I have no other way.
+#
 
-class M1WHead(nn.Module)
+#The purpose of this is to get around the limitation which doesn't allow jacobian() to work with regular modules.
+#This has a set of parameters and a functional expression which jacobian can be run against and work.
+class JacobianModel:
+    def __init__(self,params,optimizer,nn_fn):
+        """
+        params: params for the nn_fn (weights, bias, etc). These will be updated when training the model to
+                use memory
+        """
+        self.params = params
+        self.optimizer = optimizer
+        self.nn_fn = nn_fn
+
+    def optimize(self,grad):
+        with torch.no_grad():
+            self.params.grad = grad
+            self.optimizer.step()
+        
+class M1WWrapper(nn.Module):
     # wrapped_module - this module takes an additional parameter in front, which is the
     #   input memory. The rest of parameters passed to this module are forwarded to it. In
     #   finetuning usage, you would typically take an original module, wrap it with
-    #   another module that can take memory inputs, and squish it down to what the
-    #   original module expects.
-    # mem_out_module - this module takes the input memory and output of wrapped_module and returns a new value for memory
+    #   another module that can take memory inputs, and and squish it down to what the
+    #   original module expects. 
+    # mem_out_jm - A JacobianModel which the input memory and output of wrapped_module and returns a new value for memory
     # n_memory - number of memory units
-    # n_items_per_batch - number of samples in each batch. This is necessary so the right amount of memory can be
-    #   allocated
-    def __init__(self,wrapped_module,mem_out_module,n_memory,n_items_per_batch):
+    # n_batch_size - number of samples in each batch. This is necessary so the right
+    #   number of copies of independent memory can be allocated, to run in parallel (mostly for tuning)
+    #   TODO 3.5 note that having more than one item per batch doesn't save much time right now because
+    #            we run a jacobian per each sample. Running jacobians across the entire batch would
+    #            waste a lot of memory due to jacobian making a huge matrix with a lot of zeros which
+    #            shows one sample input not affecting the other sample outputs
+    def __init__(self,wrapped_module,mem_out_jm,n_memory,n_batch_size,decay):
         super().__init__()
         self.wrapped_module = wrapped_module
-        self.mem_out_module = mem_out_module
+        self.mem_out_jm = mem_out_jm
         self.n_memory = n_memory
-        self.n_items_per_batch = n_items_per_batch
-
-    def clear_memory():
-        #we register memory as a buffer so it will be automatically saved during checkpoints
-        self.memory = self.register_buffer('memory',torch.zeros(self.n_items_per_batch, self.n_memory))
+        self.n_batch_size = n_batch_size
+        self.decay = decay
+        self.clear_memory()
+        
+    def clear_memory(self):
+        #memory is a parameter so that we can get .grad of it to multiply with mem_grad from the previous cycle
+        self.memory = torch.Parameter(torch.zeros(self.n_batch_size, self.n_memory))
+        self.last_d_mem_out_params = torch.Parameter(torch.ones(self.n_batch_size, self.n_memory))
 
     def forward(self, *args, **kwargs):
         wm_out = self.wrapped_module(self.memory,*args,**kwargs)
-        mo_out = self.mem_out_module(self.memory,wm_out)
+
+        #saved for jaco_mat
+        self.last_wm_out = wm_out
+
+        return wm_out
+
+    # this must be run after each cycle. It computes the memory gradiant and updates
+    #  mem_out_jm params
+    def update_memory_nn(self):
+        with torch.no_grad():
+
+            #because forward was just run, we now have .grad populated in self.memory so we can use it here.
+            d_complete_model_out_mem_in = self.memory.grad.clone()
+
+            #optimize the nn for the memory
+            self.mem_out_jm.optimize(d_complete_model_out_mem_in * self.last_d_mem_out_params)
+
+            #update memory and update gradiant of d (mem / params)
+            #PERF: we loop through each example one at a time because jacobian doesn't work
+            #efficiently memorywise across large batches
+            for i in range(self.n_batch_size):
+                # return a function for an individual example
+                jfn = self.mem_out_jm.nn_fn(self.wm_out[i])
+
+                #we use jacobian here because we need a gradiant for each memory unit. pytorch.backwards
+                #will only calculate the gradiant for a single value
+                (d_mem_out_param,d_mem_out_mem_in) = af.jacobian(jfn,(self.params,self.mem_in[i]))
+                self.last_d_mem_out_params[i] = d_mem_out_mem_in * self.last_d_mem_out_params[i] * self.decay + d_mem_out_param
+                self.memory[i] = jfn(self.mem_out_jm.params,self.memory[i])
+
+
+            
+
+
 
         
-     
 
         
