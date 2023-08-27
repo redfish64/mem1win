@@ -99,18 +99,16 @@ for i in range(n_train_loops):
         #the only thing we may possibly be able to do is breakout and call the grad_fn and next_functions
         #manually
         for mw in mw_list:
-            squishing_param_tensors = [t for param in mw.squishing_layer.parameters() for t in param]
-            mem_out_layer_param_tensors = [t for param in mw.mem_out_layer.parameters() for t in param]
+            squishing_param_tensors = list(mw.squishing_layer.parameters())
+            mem_out_layer_param_tensors = list(mw.mem_out_layer.parameters())
             wrapper_params = squishing_param_tensors + mem_out_layer_param_tensors
 
             mem_in = list(mw.memory for mw in mw_list)
 
-            pdb.set_trace()
             #target loss to immediate params (this runs through squishing_layer and core_layer, but not mem_out params)
-            (loss_to_squishing_params_grad, *loss_to_mem_in_grad) = ag.grad((loss,),squishing_param_tensors,retain_graph=True)
-            pdb.set_trace()
-            #orig: (loss_to_squishing_params_grad, *loss_to_mem_in_grad) = ag.grad((loss,),(squishing_param_tensors+mem_in),retain_graph=True)
+            loss_to_sq_mem_in_grad = ag.grad((loss,),(squishing_param_tensors+mem_in),retain_graph=True)
 
+            pdb.set_trace()
             mem_to_mem_grad = torch.full((n_batch_size,n_mem,n_mem),0.)
             mem_to_wrapper_params_grad = torch.full((n_batch_size,n_mem,wrapper_params.shape[0]),0.)
 
