@@ -300,8 +300,7 @@ def git_is_dirty() -> str:
     return (r is None),out
 
 def _get_or_update_submodule(model,key,update_fn=None):
-    if isinstance(model, nn.ModuleList) and isinstance(key, int) or
-       isinstance(model, nn.ModuleDict) and isinstance(key, str):
+    if isinstance(model, nn.ModuleList) and isinstance(key, int) or isinstance(model, nn.ModuleDict) and isinstance(key, str):
         ret_sub_model = model[key]
         if(update_fn is not None):
             if(ret_sub_model is None):
