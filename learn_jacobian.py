@@ -19,7 +19,7 @@ def test1():
         key = params_vector[wc_size:].reshape(win_size, channel_size)
 
         #output = torch.matmul(x, weight.t()) + bias
-        output = nn.functional._scaled_dot_product_attention(query,key,x)
+        output = nn.functional.scaled_dot_product_attention(query,key,x)
 
         return output
 
@@ -194,3 +194,41 @@ def test8():
     print(jacobian_matrix[1].shape)
     print(jacobian_matrix[2].shape)
 
+def join_parameters(params):
+    return torch.cat([p.view(-1) for p in params])
+    
+#test with a normal model Linear, DON'T WORK
+def test9():
+    l = nn.Linear(3,2)
+    x = torch.randn(1, 3)
+
+    def model_func(params_vector):
+        #output = torch.matmul(x, weight.t()) + bias
+        output = l(x)
+
+        return output
+
+    #always returns zeros
+    jacobian_matrix = jacobian(model_func, join_parameters(l.parameters()))
+
+    print(jacobian_matrix)
+
+
+#test going through a model, but not using it directly
+def test10():
+    x = torch.randn(1, 3)
+    lin = nn.Linear(2,2)
+    params = torch.rand(8)
+    params.requires_grad=True
+
+    def model_func(params_vector):
+        weight = params_vector[:6].reshape(2, 3)
+        bias = params_vector[6:]
+
+        output = lin(nn.functional.linear(x,weight,bias))
+
+        return output
+
+    jacobian_matrix = jacobian(model_func, params)
+
+    print(jacobian_matrix)
