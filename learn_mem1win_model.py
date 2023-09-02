@@ -5,6 +5,7 @@ import torch.autograd as ag
 import torch.optim as o
 import torch.nn.functional as f
 import grad
+import JacModule as jm
 
 import pdb
 
@@ -23,9 +24,12 @@ class MemWrapper(nn.Module):
         core_inp = self.squishing_layer(inp,self.memory)
 
         out = self.core_layer(core_inp,*args,**kwargs)
-        self.last_run_mem_out = self.mem_out_layer(out,self.memory)
+        self.last_run_core_layer_out = out
 
         return out
+
+    def update_memory_for_next_cycle(self,mem):
+        self.memory = self.mem
 
 class SquishLinear(nn.Module):
     def __init__(self,n_in_lengths,n_out_length,**kwargs):
@@ -79,8 +83,7 @@ core_optim = o.SGD(orig_core_params,lr=learning_rate)
 
 #this would be reinitialized everytime a new set of data is started (a new book, unrelated audio recording, etc.)
 #along with memory
-
-last_mem_in_to_squish_params_grad = grad_zeros(n_mem,
+last_mem_in_to_squish_params_grad = None
 
 #training
 for i in range(n_train_loops):
@@ -95,11 +98,10 @@ for i in range(n_train_loops):
     #the only thing we may possibly be able to do is breakout and call the grad_fn and next_functions
     #manually
     for mw in mw_list:
-        squishing_param_tensors = list(mw.squishing_layer.parameters())
-        mem_out_layer_param_tensors = list(mw.mem_out_layer.parameters())
-        wrapper_params = squishing_param_tensors + mem_out_layer_param_tensors
+        mol = mw.mem_out_layer
+        
+        r = jm.jac_grad(mol,mw.last_run_core_layer_out,[mol])
 
-        mem_in = list(mw.memory for mw in mw_list)
 
         #target loss to immediate params (this runs through squishing_layer and core_layer, but not mem_out params)
         imm_loss_to_sq_mem_in_grad = ag.grad((loss,),(squishing_param_tensors+mem_in),retain_graph=True)
@@ -125,6 +127,7 @@ for i in range(n_train_loops):
         pdb.set_trace()
 
     #train core if you want
+    #note: for a pretrained model, we could train just squishing parameters here
     loss.backward()
     core_optim.step()
     core_optim.zero_grad()
