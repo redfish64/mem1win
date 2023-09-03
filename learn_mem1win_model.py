@@ -100,7 +100,8 @@ for i in range(n_train_loops):
     for mw in mw_list:
         mol = mw.mem_out_layer
         
-        r = jm.jac_grad(mol,mw.last_run_core_layer_out,[mol])
+        res = jm.jac_grad(mol,mw.last_run_core_layer_out,[mol.memory,mol.weight,mol.bias])
+        
 
 
         #target loss to immediate params (this runs through squishing_layer and core_layer, but not mem_out params)
