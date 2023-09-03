@@ -9,7 +9,7 @@ import pdb
 class _JacContext:
     params: list
     param_to_array_index : dict
-
+    
 _jac_context = None
 
 class JacModule(nn.Module):
@@ -17,13 +17,12 @@ class JacModule(nn.Module):
         if(_jac_context is None):
             return param
 
-        pdb.set_trace()
-        param_loc = _jac_context.param_to_array_index[param]
+        param_loc = _jac_context.param_to_array_index[id(param)]
         if(param_loc is None):
             return param
 
-        return _jac_context.param_to_array_index[param_loc]
-    
+        return _jac_context.params[param_loc]
+
 def jac_grad(module,inp_batch,*extra_module_args,selected_grad_jac_params=None,fake_one_row_batch=False,**extra_module_kwargs):
     """
     Runs the module against the input batch and returns the output. The jacobian is placed into the individual
@@ -42,8 +41,8 @@ def jac_grad(module,inp_batch,*extra_module_args,selected_grad_jac_params=None,f
     if(selected_grad_jac_params is None):
         selected_grad_jac_params = list(module.parameters()) # a list because we loop through them twice
 
-    for p,i in enumerate(selected_grad_jac_params):
-        param_to_array_index[p]=i
+    for i,p in enumerate(selected_grad_jac_params):
+        param_to_array_index[id(p)]=i
 
     def model_func(input_item,*params):
         global _jac_context
