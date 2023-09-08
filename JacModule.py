@@ -27,14 +27,14 @@ class JacModule(nn.Module):
 def jac_grad(module,inp_batch,*extra_module_args,repeated_grad_jac_params=None,batch_indexed_grad_jac_params=None,fake_one_row_batch=False,**extra_module_kwargs):
     """
     Runs the module against the input batch and returns the output. The jacobian is placed into the individual
-    selected parameters
+    selected parameters, as `<param>.jac_grad`
     module - the module to run. Doesn't have to be a JacModule
     inp_batch - a batch of input values as a tensor in the shape (B,...) where B is the number of items in the batch
     repeated_grad_jac_params - if not none, the jacobian will be calculated against the given parameters. Each parameter
-                               will be repeated for each batch item
+                               will be repeated for each batch item. The results will appear in `<param>.jac_grad`
     batch_indexed_grad_jac_params - if not none, the jacobian will be calculated against the given parameters. Each parameter
                                     the parameter is expected to have its outermost dimension the same size as the number
-                                    of items per batch
+                                    of items per batch. The results will appear in `<param>.jac_grad`
     fake_one_row_batch - each call is given a single input value in the batch individually (looped over with vmap)
                          Sometimes modules work better whan there is a batch dimension, so if this is true,
                          the input will be unsqueezed in dim zero before being passed.

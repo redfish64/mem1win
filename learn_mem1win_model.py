@@ -43,23 +43,24 @@ n_train_loops = 10
 
 learning_rate = 3e-4
 
-cycle_decay = 0.99
+jac_grad_decay = 0.99
 
 #first lets fake a core    
 core = nn.Sequential(nn.Sequential(*(nn.Linear(n_core_inout,n_core_inout) for _ in range(n_core_layers))),
                      nn.Softmax())
 
-#params without our memory stuff
-orig_core_params = list(core.parameters())
-
 mw_list = []
 
 #now lets "wrap" the core
 for i in range(n_core_layers):
-    memory = nn.Parameter(torch.full((n_batch_size,n_mem,),0.))
+    memory = nn.Parameter(torch.full((n_batch_size,n_mem),0.))
     mem_in_layer = jm.MemJacLinear(memory,n_core_inout,n_core_inout) # this layer doesn't need to be jac compatible
     # but we need to include memory in the input
     mem_out_layer = jm.MemJacLinear(memory,n_core_inout,n_mem)
+
+    memory.running_jac_grad = torch.zeros((n_batch_size,n_mem,n_mem))
+    mem_out_layer.weight.running_jac_grad = torch.zeros((n_batch_size,n_mem,n_mem,n_mem+n_core_inout))
+    mem_out_layer.bias.running_jac_grad = torch.zeros((n_batch_size,n_mem,n_mem))
 
     #we're just linearly replacing each layer but in a real model, it could be more tricky with multiple heads, etc.
     #so the end result is we keep a mw_list which we use to do all mem related stuff without having to revisit the
@@ -68,7 +69,9 @@ for i in range(n_core_layers):
     core[0][i]=mw
     mw_list.append(mw)
 
-core_optim = o.SGD(orig_core_params,lr=learning_rate)
+#this will train everything at once, the wrapper and the main model. We could train just the mem wrapper for pretrained
+#models, it's up to you.
+core_optim = o.SGD(core.parameters(),lr=learning_rate)
 
 #training
 for i in range(n_train_loops):
@@ -78,6 +81,7 @@ for i in range(n_train_loops):
     core_out = core(train_in)
 
     loss = f.cross_entropy(core_out,train_target)
+    loss.backward()
 
     for mw in mw_list:
         mol = mw.mem_out_layer
@@ -87,40 +91,30 @@ for i in range(n_train_loops):
             #         using mw.last_run_core_layer_out, since it would slow things down a lot
             #         if we recomputed the model.  we probably want to try recomputing the model
             #         if things don't work well.
+            #note, in the current state, the grad for mol.bias is always 1. We could hardcode this, but
+            #if we change code creating the memwrapper model maybe that will change.
             res = jm.jac_grad(mol,mw.last_run_core_layer_out,repeated_grad_jac_params=[mol.weight,mol.bias],batch_indexed_grad_jac_params=[mw.memory])
         
-        pdb.set_trace()
+            #update the current weight and bias based on the setting the memory in the past
+            mol.weight.grad = (mw.memory.grad.unsqueeze(-1).unsqueeze(-1) * mol.weight.running_jac_grad).sum(dim=0).sum(dim=0)
+            mol.bias.grad = (mw.memory.grad.unsqueeze(-1) * mol.bias.running_jac_grad).sum(dim=0).sum(dim=0)
 
-        #target loss to immediate params (this runs through mem_in_layer and core_layer, but not mem_out params)
-        imm_loss_to_sq_mem_in_grad = ag.grad((loss,),(squishing_param_tensors+mem_in),retain_graph=True)
-        imm_loss_to_squishing_param_tensors_grad = grad.grad_from_list(loss_to_sq_mem_in_grad[0:len(squishing_param_tensors)])
-        loss_to_mem_in_grad = grad.grad_from_list(loss_to_sq_mem_in_grad[len(squishing_param_tensors):])
+            #clear out grad for the next training loop (jac grad doesn't need this)
+            mw.memory.grad = None
 
-        loss_to_past_squishing_params_grad = grad.combine_grads(loss_to_mem_in_grad,last_mem_in_to_squish_params_grad)
-        loss_to_squishing_params_grad = imm_loss_to_squishing_param_tensors_grad + loss_to_past_squishing_params_grad
+            #update the running jac grad's for the next training loop
+            mol.weight.running_jac_grad = mol.weight.running_jac_grad * mw.memory.jac_grad.unsqueeze(-1) * jac_grad_decay + mol.weight.jac_grad
+            mol.bias.running_jac_grad = mol.bias.running_jac_grad * mw.memory.jac_grad * jac_grad_decay + mol.bias.jac_grad
+            mw.memory.running_jac_grad = mw.memory.running_jac_grad * mw.memory.jac_grad * jac_grad_decay + mw.memory.jac_grad
 
-        loss_to_mem_out_params_grad = loss_to_mem_in_grad * last_mem_in_to_mem_out_grad
-
-
-        mem_to_mem_grad = torch.full((n_batch_size,n_mem,n_mem),0.)
-        mem_to_wrapper_params_grad = torch.full((n_batch_size,n_mem,len(wrapper_params)),0.)
-
-        for bi in range(n_batch_size):
-            for mi in range(n_mem):
-                (mem_item_to_mem_grad,*mem_item_to_wrapper_params_grad) = ag.grad((mw.last_run_mem_out[bi,mi],),[mw.memory[bi]]+wrapper_params,retain_graph=True)
-                pdb.set_trace()
-                mem_to_mem_grad[bi,mi] = mem_item_to_mem_grad
-                mem_to_wrapper_params_grad[bi,mi] = mem_item_to_wrapper_params_grad
-
-        pdb.set_trace()
+            
 
     #train core if you want
     #note: for a pretrained model, we could train just squishing parameters here
-    loss.backward()
     core_optim.step()
     core_optim.zero_grad()
 
-
+print("one loop done")
 
 
 
