@@ -97,4 +97,23 @@ def test5():
     print(grad)
 
     return grad
+
+#test passing the batch index to the model_func
+def test6():
+    torch.manual_seed(42)
+    weight = torch.rand(2,3)
+    bias = torch.rand(2)
+    x = torch.randn(5,3)
+    batch_indices = torch.arange(5)
+    
+    def model_func(x,batch_index,weight_in,bias_in):
+        #pdb.set_trace()
+        output = nn.functional.linear(x,weight_in,bias_in) + 1000 * batch_index
+
+        return output,output
+
+    grad = f.vmap(f.jacrev(model_func,argnums=(2,3),has_aux=True),in_dims=(0,0,None,None))(x,batch_indices,weight,bias)
+    print(grad)
+
+    return grad
  

@@ -6,22 +6,24 @@ import torch.optim as o
 import torch.nn.functional as f
 import grad
 import JacModule as jm
+from importlib import reload
+reload(jm) #hack to reload JacModule as I debug it
 
 import pdb
 
 class MemWrapper(nn.Module):
-    def __init__(self,core_layer, squishing_layer, mem_out_layer, n_batch_size, n_mem):
+    def __init__(self,core_layer, mem_in_layer, mem_out_layer, n_batch_size, memory):
         super().__init__()
         self.core_layer = core_layer
-        self.squishing_layer = squishing_layer
+        self.mem_in_layer = mem_in_layer
         self.mem_out_layer = mem_out_layer
         self.n_mem = n_mem
         self.n_batch_size = n_batch_size
-        self.memory = nn.Parameter(torch.full((n_batch_size,n_mem,),0.))
+        self.memory = memory
 
     def forward(self,inp,*args,**kwargs):
         assert (inp.shape[0] == self.n_batch_size)
-        core_inp = self.squishing_layer(inp,self.memory)
+        core_inp = self.mem_in_layer(inp)
 
         out = self.core_layer(core_inp,*args,**kwargs)
         self.last_run_core_layer_out = out
@@ -31,20 +33,6 @@ class MemWrapper(nn.Module):
     def update_memory_for_next_cycle(self,mem):
         self.memory = self.mem
 
-class SquishLinear(nn.Module):
-    def __init__(self,n_in_lengths,n_out_length,**kwargs):
-        super().__init__()
-        self.n_in_lengths = n_in_lengths
-        self.n_out_length = n_out_length
-
-        total_in_length = sum(n_in_lengths)
-        self.lin = nn.Linear(total_in_length, n_out_length)
-
-    def forward(self, *args, **kwargs):
-        ins_data_split = len(self.n_in_lengths)
-        in_data = torch.cat(args[0:ins_data_split],dim=-1)
-        return self.lin(in_data,*args[ins_data_split:],**kwargs)
-     
 #params
 n_core_layers = 5
 n_mem = 6
@@ -68,43 +56,42 @@ mw_list = []
 
 #now lets "wrap" the core
 for i in range(n_core_layers):
-    squishing_layer = SquishLinear((n_core_inout,n_mem), n_core_inout)
-    mem_out_layer = SquishLinear((n_core_inout,n_mem),n_mem)
+    memory = nn.Parameter(torch.full((n_batch_size,n_mem,),0.))
+    mem_in_layer = jm.MemJacLinear(memory,n_core_inout,n_core_inout) # this layer doesn't need to be jac compatible
+    # but we need to include memory in the input
+    mem_out_layer = jm.MemJacLinear(memory,n_core_inout,n_mem)
 
     #we're just linearly replacing each layer but in a real model, it could be more tricky with multiple heads, etc.
     #so the end result is we keep a mw_list which we use to do all mem related stuff without having to revisit the
     #original model
-    mw = MemWrapper(core[0][i],squishing_layer, mem_out_layer, n_batch_size, n_mem)
+    mw = MemWrapper(core[0][i],mem_in_layer, mem_out_layer, n_batch_size, memory)
     core[0][i]=mw
     mw_list.append(mw)
 
 core_optim = o.SGD(orig_core_params,lr=learning_rate)
 
-
-#this would be reinitialized everytime a new set of data is started (a new book, unrelated audio recording, etc.)
-#along with memory
-last_mem_in_to_squish_params_grad = None
-
 #training
 for i in range(n_train_loops):
-    train_in = torch.rand((n_batch_size,n_core_inout))
-    train_target = torch.rand((n_batch_size,n_core_inout))
+    train_in = torch.rand((n_batch_size,n_core_inout)) #HACK
+    train_target = torch.rand((n_batch_size,n_core_inout)) #HACK
 
     core_out = core(train_in)
 
     loss = f.cross_entropy(core_out,train_target)
 
-    #mem_out to mem_in (very slow can't help it)
-    #the only thing we may possibly be able to do is breakout and call the grad_fn and next_functions
-    #manually
     for mw in mw_list:
         mol = mw.mem_out_layer
-        
-        res = jm.jac_grad(mol,mw.last_run_core_layer_out,[mol.memory,mol.weight,mol.bias])
-        
 
+        with torch.no_grad():
+            #TODO 2.5 here we are ignoring the model when computing the gradiant and directly
+            #         using mw.last_run_core_layer_out, since it would slow things down a lot
+            #         if we recomputed the model.  we probably want to try recomputing the model
+            #         if things don't work well.
+            res = jm.jac_grad(mol,mw.last_run_core_layer_out,repeated_grad_jac_params=[mol.weight,mol.bias],batch_indexed_grad_jac_params=[mw.memory])
+        
+        pdb.set_trace()
 
-        #target loss to immediate params (this runs through squishing_layer and core_layer, but not mem_out params)
+        #target loss to immediate params (this runs through mem_in_layer and core_layer, but not mem_out params)
         imm_loss_to_sq_mem_in_grad = ag.grad((loss,),(squishing_param_tensors+mem_in),retain_graph=True)
         imm_loss_to_squishing_param_tensors_grad = grad.grad_from_list(loss_to_sq_mem_in_grad[0:len(squishing_param_tensors)])
         loss_to_mem_in_grad = grad.grad_from_list(loss_to_sq_mem_in_grad[len(squishing_param_tensors):])
