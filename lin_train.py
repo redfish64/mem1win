@@ -298,6 +298,7 @@ def init_argparse() -> argparse.ArgumentParser:
 
     shared_parser = argparse.ArgumentParser(add_help=False)
     shared_parser.add_argument('--bos', action='store_true', help='if set, will drop into a debugger on start')
+    shared_parser.add_argument('--wrap_model', action='store_true', help='if set, will wrap the model with the memory layer')
     shared_parser.add_argument('--pre_start_token', nargs='?', type=int,default=0, help='token to use to fill the buffer before the file begins. This is used when offseting the position the buffer reads the files differently for each loop')
     shared_parser.add_argument('--post_end_token', nargs='?', type=int,default=1, help='token to use to fill the buffer after the file ends.')
     shared_parser.add_argument('--device', nargs='?', default="cpu",help='device to run on (cpu or cuda)')
@@ -514,6 +515,12 @@ def run_training(config,enc,ms):
                 est_loss(ms,config)
                 stats.last_est_loss_time = time.time()
 
+def wrap_model(config,model):
+    t = model.contained_model.transformer
+    for i in range(len(t.h)):
+        block_size=256,n_embd=384,
+pass
+                
 def main():
     global stats
 
@@ -529,6 +536,10 @@ def main():
         (ms,stats) = load_model_state(config.load_model,enc,config)
     else:
         ms = create_model_state(enc,config)
+
+    if(config.wrap_model):
+        print("wrapping model")
+        (ms,wrapping_optimizer) = wrap_model(config,ms.mdl)
 
     print(sum(p.numel() for p in ms.mdl.parameters())/1e6, 'M parameters')
     if(config.bos):

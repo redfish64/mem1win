@@ -114,7 +114,7 @@ for i in range(n_train_loops):
     core_optim.step()
     core_optim.zero_grad()
 
-print("one loop done")
+print("done")
 
 
 
