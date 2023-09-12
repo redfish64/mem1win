@@ -516,10 +516,7 @@ def run_training(config,enc,ms):
                 stats.last_est_loss_time = time.time()
 
 def wrap_model(config,model):
-    t = model.contained_model.transformer
-    for i in range(len(t.h)):
-        block_size=256,n_embd=384,
-pass
+    pass
                 
 def main():
     global stats
