@@ -66,9 +66,7 @@ class CausalSelfAttention(nn.Module):
                                  .view(1, 1, config.block_size,total_size)) == 1
 
     def get_jac_params(self):
-        return (self.c_attn.get_jac_params() +
-                self.c_proj.get_jac_params() +
-                self.c_mem_attn.get_jac_params() +
+        return (self.c_mem_attn.get_jac_params() +
                 self.c_mem_proj.get_jac_params())
         
     def forward(self, mem, x):
@@ -183,7 +181,8 @@ class Block(nn.Module):
         self.memory = jm.JacParameter(torch.zeros((config.batch_size,
                                                    config.n_memory_per_layer,
                                                    config.n_mem_embd)),
-                                      is_batch_indexed=True)
+                                      is_batch_indexed=True,
+                                      requires_grad=True)
 
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.mem_ln_1 = LayerNorm(config.n_mem_embd, bias=config.bias)
@@ -219,9 +218,11 @@ class Block(nn.Module):
         #vmap_randomness is cause scaled_dot_product_attention does randomness. Why? dunno.
         new_mem = jm.jac_grad(self._calc_mem_out,x,jac_params,fake_one_row_batch=True,vmap_randomness='different')
 
-        pdb.set_trace()
         for jp in jac_params:
-            jp.grad += jp.calc_grad_from_running_jac_grad(self.memory.grad)
+            #Note, if we start calculating grad for jac parameters during loss, we'll have to change
+            #this to +. For now, though, the grad is none, so plus wouldn't work and we just set it
+            #orig:
+            jp.grad = jp.calc_grad_from_running_jac_grad(self.memory.grad)
             jp.update_running_jac_grad(self.jac_grad_decay,self.memory.jac_grad)
         
         self.memory.copy_(new_mem)

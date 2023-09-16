@@ -299,20 +299,24 @@ def git_is_dirty() -> str:
     r = re.match('On branch [^\n]+\nnothing to commit, working tree clean',out)
     return (r is None),out
 
-def match_dims(a,b):
+def match_dims(a,b,add_on_left=False):
     """
     Makes a have the same number of dimensions in its shape by prepending size 1 dimensions.
     So if tensor a has shape (2,3) and tensor b with shape (5,3,2,3) match_dims(a,b) would return a view of a
     with shape of (1,1,2,3).
     """
-    view_args = [1] * (b.dim() - a.dim()) + list(a.shape)
+    if(add_on_left):
+        view_args = [1] * (b.dim() - a.dim()) + list(a.shape)
+    else:
+        view_args = list(a.shape) + [1] * (b.dim() - a.dim()) 
     return a.view(*view_args)
     
-def sum_last_dims(t,num_dims):
+def sum_dims(t,num_dims,sum_on_left=False):
     """
-    sums the last dimensions and returns the result
+    sums the dimensions on the left or the right and returns the result
     """
 
+    if(s
     return torch.sum(t,list(range(t.dim() - num_dims, t.dim())))
 
     

@@ -506,7 +506,6 @@ def run_training(config,enc,ms):
                     
             logits,loss,last_item_loss = ms.mdl(batch,targets)
             ms.optimizer.zero_grad(set_to_none=True)
-            pdb.set_trace()
             loss.backward()
             ms.mdl.update_memory_and_mem_params()
             ms.optimizer.step() # TODO 2 make sure that optimizer has right params

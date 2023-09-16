@@ -12,17 +12,18 @@ class JacParameter(nn.Parameter):
     A JacParameter allows for a parameter to be used as a `grad_jac_params` argument to jac_grad.
     When used, it must be wrapped in a call as follows: get_jac_param(<param>)
     """
-    def __new__(cls,data,is_batch_indexed=False,**kwargs):
+    def __new__(cls,data,is_batch_indexed=False,requires_grad=False):
         """
         is_batched_indexed - if true, then each parameter is expected to have its outermost dimension the same size as
                              the number of items per batch. If false, each JacParameter object will be repeated for each
                              batch item. 
         """
-        instance = torch.nn.Parameter._make_subclass(cls, data, **kwargs)
+        instance = torch.nn.parameter.Parameter._make_subclass(cls, data, requires_grad)
         instance.is_batch_indexed = is_batch_indexed
         instance.jac_grad = None
         instance.jac_param = None
         instance.running_jac_grad = None
+        instance.requires_grad = requires_grad
         return instance
 
     def calc_grad_from_running_jac_grad(self,jac_out_to_loss_grad,reset_grad=False):
@@ -32,9 +33,24 @@ class JacParameter(nn.Parameter):
 
         jac_out_to_loss_out - the gradiant from the loss to the output of whatever this jac parameter is being calculated to
         """
-        dimmed_loss_grad = u.match_dims(jac_out_to_loss_grad,self.running_jac_grad)
+        if(self.running_jac_grad is None):
+            self.running_jac_grad = torch.zeros_like(self.jac_grad,dtype=self.data.dtype)
 
-        return u.sum_last_dims(dimmed_loss_grad * self.running_jac_grad, jac_out_to_loss_grad.dim())
+        #number of dimensions in the memory output
+        n_mem_dims = jac_out_to_loss_grad.dim() 
+        #number of dimensions of the parameter
+        n_dims = self.data.dim()
+
+        #in jac_grad, the memory dims appear first (are on the outside) and the jac parameter dims are on the inside
+
+        #we need to expand out the jac_out_to_loss which is in the shape of the jac parameter
+        #to the jac_grad, which has the memory dims on the outside
+        dimmed_loss_grad = jac_out_to_loss_grad.view(list(jac_out_to_loss_grad.size()) + [1] * n_dims)
+
+        res = dimmed_loss_grad * self.running_jac_grad
+
+        pdb.set_trace()
+        return torch.sum(res, list(range(n_mem_dims)))
 
     def update_running_jac_grad(self,decay, out_to_out):
         """
@@ -45,10 +61,6 @@ class JacParameter(nn.Parameter):
         decay - how much to decay the previous old gradiants when updating, a value from 0 to 1.
         out_to_out - the gradiant from how the output of the last cycle affects the current one
         """
-
-        if(self.running_jac_grad is None):
-            self.running_jac_grad = self.jac_grad
-            return
 
         dimmed_out_to_out = u.match_dims(out_to_out,self.jac_grad)
 
@@ -88,8 +100,10 @@ def jac_grad(module,inp_batch,grad_jac_params,*extra_module_args,fake_one_row_ba
         for jp,p in zip(params,all_grad_jac_params):
             p.jac_param = jp
 
-        output = module(input_item.unsqueeze(0) if fake_one_row_batch else input_item,
-                        *extra_module_args,**extra_module_kwargs)
+        if fake_one_row_batch:
+            output = module(input_item.unsqueeze(0)).squeeze(0)
+        else:
+            output = module(input_item.unsqueeze(0))
 
         for p in all_grad_jac_params:
             p.jac_param = None
