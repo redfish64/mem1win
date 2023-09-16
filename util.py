@@ -299,32 +299,20 @@ def git_is_dirty() -> str:
     r = re.match('On branch [^\n]+\nnothing to commit, working tree clean',out)
     return (r is None),out
 
-def _get_or_update_submodule(model,key,update_fn=None):
-    if isinstance(model, nn.ModuleList) and isinstance(key, int) or isinstance(model, nn.ModuleDict) and isinstance(key, str):
-        ret_sub_model = model[key]
-        if(update_fn is not None):
-            if(ret_sub_model is None):
-                return None
-            model[key] = update_fn(ret_sub_model)
-        return ret_sub_model
-    else:
-        ret_sub_module = getattr(model, key)
-        if(update_fn is not None):
-            if(ret_sub_model is None):
-                return None
-            setattr(model,key,update_fn(ret_sub_model))
-        return ret_sub_model
+def match_dims(a,b):
+    """
+    Makes a have the same number of dimensions in its shape by prepending size 1 dimensions.
+    So if tensor a has shape (2,3) and tensor b with shape (5,3,2,3) match_dims(a,b) would return a view of a
+    with shape of (1,1,2,3).
+    """
+    view_args = [1] * (b.dim() - a.dim()) + list(a.shape)
+    return a.view(*view_args)
+    
+def sum_last_dims(t,num_dims):
+    """
+    sums the last dimensions and returns the result
+    """
 
-# Recursive function to navigate through the path
-def wrap_sub_module(model, path, update_fn, path_index=0):
-    if model is None:
-        raise ValueError('bad path element {path=}, {path[path_index]=}')
-    if path_index == len(path):
-        raise ValueError('internal error, at end of path')
-        
-    if path_index == len(path-1):
-        _get_or_update_submodule(model,path[path_index], update_fn)
-    else:
-        next_model = _get_or_update_submodule(model,path[path_index])
-        wrap_sub_module(model,path,path_index+1)
+    return torch.sum(t,list(range(t.dim() - num_dims, t.dim())))
 
+    

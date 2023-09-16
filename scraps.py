@@ -56,3 +56,58 @@ class MemOutLayer(nn.Module):
                 mem_to_wrapper_params_grad[bi,mi] = mem_item_to_wrapper_params_grad
 
         pdb.set_trace()
+
+class JacParameter(nn.Parameter):
+    def __init__(self,is_batch_indexed=False,**kwargs):
+        """
+        is_batched_indexed - if true, then each parameter is expected to have its outermost dimension the same size as
+                             the number of items per batch. If false, each JacParameter object will be repeated for each
+                             batch item. 
+        """
+        super().__init__(**kwargs)
+        self.is_batch_indexed = is_batch_indexed
+
+    @property
+    def data(self):
+        pdb.set_trace()
+        # if we are being called from jac_grad, we use the parameters passed into the underlying jacrev call, otherwise
+        # the straight data
+        if(_jac_context is None):
+            return super(JacParameter).data
+
+        param_loc = _jac_context.param_to_array_index[id(self)]
+        if(param_loc is None):
+            return super(JacParameter).data
+
+        return _jac_context.params[self]
+        
+                          
+def _get_or_update_submodule(model,key,update_fn=None):
+    if isinstance(model, nn.ModuleList) and isinstance(key, int) or isinstance(model, nn.ModuleDict) and isinstance(key, str):
+        ret_sub_model = model[key]
+        if(update_fn is not None):
+            if(ret_sub_model is None):
+                return None
+            model[key] = update_fn(ret_sub_model)
+        return ret_sub_model
+    else:
+        ret_sub_model = getattr(model, key)
+        if(update_fn is not None):
+            if(ret_sub_model is None):
+                return None
+            setattr(model,key,update_fn(ret_sub_model))
+        return ret_sub_model
+
+# Recursive function to navigate through the path
+def wrap_sub_module(model, path, update_fn, path_index=0):
+    if model is None:
+        raise ValueError('bad path element {path=}, {path[path_index]=}')
+    if path_index == len(path):
+        raise ValueError('internal error, at end of path')
+        
+    if path_index == len(path-1):
+        _get_or_update_submodule(model,path[path_index], update_fn)
+    else:
+        next_model = _get_or_update_submodule(model,path[path_index])
+        wrap_sub_module(model,path,path_index+1)
+

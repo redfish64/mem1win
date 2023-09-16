@@ -11,8 +11,7 @@ import re
 import os
 import pdb
 import matplotlib.pyplot as plt
-import model
-from dummy import DummyMemoryModel
+import mem_model as model
 
 # the reason I copied util into this git tree is so that there is a consistent commit. When we run each
 # session, I want to record the git state along with all parameters, so that I can reproduce/track the results
@@ -310,6 +309,8 @@ def init_argparse() -> argparse.ArgumentParser:
     train_parser.add_argument('--n_loops', nargs='?', type=int,default=100,help='number of times to loop through data')
     train_parser.add_argument('--n_head', nargs='?', type=int,default=6,help='number of heads per layer')
     train_parser.add_argument('--n_embd', nargs='?', type=int,default=384,help='number of embedding dimensions')
+    train_parser.add_argument('--n_mem_embd', nargs='?', type=int,default=96,help='number of embedding dimensions for memory. These are more costly than normal embeddings due to the jacobian')
+    train_parser.add_argument('--n_memory_per_layer', nargs='?', type=int,default=8,help='number of memory values to store across cycles')
     train_parser.add_argument('--dropout', nargs='?', type=float,default=0.2,help='dropout percentage')
     train_parser.add_argument('--n_layer', nargs='?', type=int,default=6,help='number of layers')
     train_parser.add_argument('--min_text_size', nargs='?', type=int,default=10000,help='min size of text files to process (others will be skipped)')
@@ -323,6 +324,7 @@ def init_argparse() -> argparse.ArgumentParser:
     train_parser.add_argument('--no_bias', action='store_true',help='GPT param, whether to have a bias or not. GPT creator seems to think its cool not to have')
     train_parser.add_argument('--learning_rate', nargs='?',type=float,default=6e-4,help='learning rate for optimizer')
     train_parser.add_argument('--weight_decay', nargs='?',type=float,default=1e-1,help='GPT module parameter to try and force the weights closer to zero')
+    train_parser.add_argument('--jac_grad_decay', nargs='?',type=float,default=0.01,help='Amount to decay the effect of the previous cycles grads on the current learning step. From 0.0 to 1.0')
     train_parser.add_argument('--beta1', nargs='?',type=float,default=0.9,help='AdamW parameter to control running average for momentum')
     train_parser.add_argument('--beta2', nargs='?',type=float,default=0.95,help='AdamW parameter to control running average for momentum')
     train_parser.add_argument('--load_model', nargs='?',help='load a previously generated model')
@@ -351,14 +353,15 @@ def create_model_state(enc,config):
     #max_token_value is one less than the vocab size as far as I can tell, see:
     #https://github.com/openai/tiktoken/blob/7830ed537badecefb5a357448be722bfd58f9fca/tiktoken/core.py
     gptconf = model.GPTConfig(block_size=config.block_size,vocab_size=config.vocab_size,n_layer=config.n_layer,
-                              n_head=config.n_head,n_embd=config.n_embd,dropout=config.dropout,bias=not config.no_bias)
+                              n_head=config.n_head,n_mem_embd=config.n_mem_embd,n_embd=config.n_embd,dropout=config.dropout,bias=not config.no_bias,
+                              batch_size=config.batch_size,n_memory_per_layer=config.n_memory_per_layer,
+                              jac_grad_decay=config.jac_grad_decay)
     m = model.GPT(gptconf)
-    m = DummyMemoryModel(m)
     m.to(config.device)
     
     wl = WorkLoader(enc,{},create_files_iter_fn(config.dir_tree),config.batch_size,config.block_size,config.n_loops,config.device,config.pre_start_token,config.post_end_token,config.min_text_size,config.max_text_size)
 
-    optimizer = m.contained_model.configure_optimizers(config.weight_decay, config.learning_rate, (config.beta1, config.beta2), config.device)
+    optimizer = m.configure_optimizers(config.weight_decay, config.learning_rate, (config.beta1, config.beta2), config.device)
 
     if(config.test_dir_tree is not None):
         test_wl = WorkLoader(enc,{},create_files_iter_fn(config.test_dir_tree),config.batch_size,config.block_size,1,config.device,config.pre_start_token,config.post_end_token,config.min_text_size,config.max_text_size)
@@ -501,11 +504,12 @@ def run_training(config,enc,ms):
                 if(bp == 0):
                     ms.mdl_reset_memory_for_item_in_batch(index)
                     
-            #pdb.set_trace()
             logits,loss,last_item_loss = ms.mdl(batch,targets)
             ms.optimizer.zero_grad(set_to_none=True)
+            pdb.set_trace()
             loss.backward()
-            ms.optimizer.step()
+            ms.mdl.update_memory_and_mem_params()
+            ms.optimizer.step() # TODO 2 make sure that optimizer has right params
             print_status(ms,config.print_status,config.trailing_avg_perc,loss,last_item_loss)
             
             if(time.time() - stats.last_save_time >= config.save_model_time):
