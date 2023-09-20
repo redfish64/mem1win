@@ -315,13 +315,14 @@ def init_argparse() -> argparse.ArgumentParser:
     train_parser.add_argument('--n_layer', nargs='?', type=int,default=6,help='number of layers')
     train_parser.add_argument('--min_text_size', nargs='?', type=int,default=10000,help='min size of text files to process (others will be skipped)')
     train_parser.add_argument('--max_text_size', nargs='?', type=int,default=1024*1024*10,help='max size of text files to process (others will be skipped)')
-    train_parser.add_argument('--trailing_avg_perc', nargs='?', type=float,default=0.99,help='only used for display. When printing status, we use a trailing avg. This is the percentage to keep from the previous runs, the remainder is for the current one.')
+    train_parser.add_argument('--trailing_avg_perc', nargs='?', type=float,default=0.01,help='only used for display. When printing status, we use a trailing avg. This is the percentage to keep from the previous runs, the remainder is for the current one.')
     train_parser.add_argument('--test_dir_tree',nargs='?',help='directory tree to look for zipped text files for testing. All of these files will be run to estimate loss so don\'t add too many here')
     train_parser.add_argument('--print_status', nargs='?',type=float,default=10,help='time between printing status updates and estimating loss in seconds')
     train_parser.add_argument('--save_model_time', nargs='?',type=float,default=60*15,help='time between saving the model in seconds')
     train_parser.add_argument('--est_loss_time', nargs='?',type=float,default=60,help='time between estimating the loss of the model in seconds')
     train_parser.add_argument('--no_save', action='store_true',help='won\'t save the model automatically. The model can still be saved by interrupt')
-    train_parser.add_argument('--no_bias', action='store_true',help='GPT param, whether to have a bias or not. GPT creator seems to think its cool not to have')
+    train_parser.add_argument('--no_bias', action='store_true',help='GPT param, whether to have a bias or not. GPT creator seems to think it\'s better not to have')
+    train_parser.add_argument('--no_flash', action='store_true',help='True if scaled_dot_product_attention function shouldn\'t be used even if available')
     train_parser.add_argument('--learning_rate', nargs='?',type=float,default=6e-4,help='learning rate for optimizer')
     train_parser.add_argument('--weight_decay', nargs='?',type=float,default=1e-1,help='GPT module parameter to try and force the weights closer to zero')
     train_parser.add_argument('--jac_grad_decay', nargs='?',type=float,default=0.01,help='Amount to decay the effect of the previous cycles grads on the current learning step. From 0.0 to 1.0')
@@ -355,7 +356,8 @@ def create_model_state(enc,config):
     gptconf = model.GPTConfig(block_size=config.block_size,vocab_size=config.vocab_size,n_layer=config.n_layer,
                               n_head=config.n_head,n_mem_embd=config.n_mem_embd,n_embd=config.n_embd,dropout=config.dropout,bias=not config.no_bias,
                               batch_size=config.batch_size,n_memory_per_layer=config.n_memory_per_layer,
-                              jac_grad_decay=config.jac_grad_decay)
+                              jac_grad_decay=config.jac_grad_decay,
+                              no_flash=config.no_flash)
     m = model.GPT(gptconf)
     m.to(config.device)
     
@@ -518,9 +520,6 @@ def run_training(config,enc,ms):
                 est_loss(ms,config)
                 stats.last_est_loss_time = time.time()
 
-def wrap_model(config,model):
-    pass
-                
 def main():
     global stats
 
@@ -536,10 +535,6 @@ def main():
         (ms,stats) = load_model_state(config.load_model,enc,config)
     else:
         ms = create_model_state(enc,config)
-
-    if(config.wrap_model):
-        print("wrapping model")
-        (ms,wrapping_optimizer) = wrap_model(config,ms.mdl)
 
     print(sum(p.numel() for p in ms.mdl.parameters())/1e6, 'M parameters')
     if(config.bos):

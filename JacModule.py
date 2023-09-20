@@ -12,7 +12,7 @@ class JacParameter(nn.Parameter):
     A JacParameter allows for a parameter to be used as a `grad_jac_params` argument to jac_grad.
     When used, it must be wrapped in a call as follows: get_jac_param(<param>)
     """
-    def __new__(cls,data,is_batch_indexed=False,requires_grad=False):
+    def __new__(cls,data,requires_grad,is_batch_indexed=False):
         """
         is_batched_indexed - if true, then each parameter is expected to have its outermost dimension the same size as
                              the number of items per batch. If false, each JacParameter object will be repeated for each
@@ -39,32 +39,32 @@ class JacParameter(nn.Parameter):
         #number of dimensions in the memory output
         n_mem_dims = jac_out_to_loss_grad.dim() 
         #number of dimensions of the parameter
-        n_dims = self.data.dim()
+        n_dims = self.data.dim() - (1 if self.is_batch_indexed else 0)
 
         #in jac_grad, the memory dims appear first (are on the outside) and the jac parameter dims are on the inside
-
         #we need to expand out the jac_out_to_loss which is in the shape of the jac parameter
         #to the jac_grad, which has the memory dims on the outside
         dimmed_loss_grad = jac_out_to_loss_grad.view(list(jac_out_to_loss_grad.size()) + [1] * n_dims)
 
         res = dimmed_loss_grad * self.running_jac_grad
 
-        pdb.set_trace()
-        return torch.sum(res, list(range(n_mem_dims)))
+        res = torch.sum(res, list(range(1 if self.is_batch_indexed else 0,n_mem_dims)))
 
-    def update_running_jac_grad(self,decay, out_to_out):
+        return res
+
+    def update_running_jac_grad(self,decay, cycle_out_to_cycle_out):
         """
         This updates the jac gradiant for a cycle through the model. It takes the existing running gradiant and averages
         it with the current gradiant. This way we get an estimation of how a parameter affects the output of
         the current round from all prior rounds.
 
         decay - how much to decay the previous old gradiants when updating, a value from 0 to 1.
-        out_to_out - the gradiant from how the output of the last cycle affects the current one
+        cycle_out_to_cycle_out - the gradiant from how the output of the last cycle affects the current one
         """
 
-        dimmed_out_to_out = u.match_dims(out_to_out,self.jac_grad)
+        res = u.cross_product_batch_ldim_tensors(cycle_out_to_cycle_out,3,self.running_jac_grad,3)
 
-        self.running_jac_grad = self.running_jac_grad * (1. - decay) * dimmed_out_to_out + self.jac_grad * decay
+        self.running_jac_grad = res * (1. - decay) + self.jac_grad * decay
         
 def jac_grad(module,inp_batch,grad_jac_params,*extra_module_args,fake_one_row_batch=False,vmap_randomness='error',**extra_module_kwargs):
     """
@@ -98,7 +98,10 @@ def jac_grad(module,inp_batch,grad_jac_params,*extra_module_args,fake_one_row_ba
 
     def model_func(input_item,*params):
         for jp,p in zip(params,all_grad_jac_params):
-            p.jac_param = jp
+            if(p.is_batch_indexed):
+                p.jac_param = jp.unsqueeze(0)
+            else:
+                p.jac_param = jp
 
         if fake_one_row_batch:
             output = module(input_item.unsqueeze(0)).squeeze(0)
@@ -127,13 +130,13 @@ def get_jac_param(jp):
     return jp.jac_param if jp.jac_param is not None else jp
 
 class JacLinear(nn.Module):
-    def __init__(self,n_in,n_out,has_bias=True):
+    def __init__(self,n_in,n_out,requires_grad,has_bias=True):
         super().__init__()
         self.n_in = n_in
         self.n_out = n_out
 
-        self.weight = JacParameter(torch.randn((n_out,n_in)) * 0.01)
-        self.bias = JacParameter(torch.zeros((n_out,)) * 0.01) if has_bias else None
+        self.weight = JacParameter(torch.randn((n_out,n_in)) * 0.01,requires_grad)
+        self.bias = JacParameter(torch.zeros((n_out,)) * 0.01,requires_grad) if has_bias else None
 
     def get_jac_params(self):
         return [self.weight] + ([self.bias] if self.bias is not None else [])
@@ -142,15 +145,15 @@ class JacLinear(nn.Module):
 
 #concatenates two inputs into one and passes to a linear
 class SquishJacLinear(nn.Module):
-    def __init__(self,in_lengths,out_length,**kwargs):
+    def __init__(self,in_lengths,out_length,requires_grad,**kwargs):
         super().__init__()
         self.in_lengths = in_lengths
         self.out_length = out_length
 
         total_in_length = sum(in_lengths)
 
-        self.weight = JacParameter(torch.randn((out_length,total_in_length)) * 0.01)
-        self.bias = JacParameter(torch.zeros((out_length,)))
+        self.weight = JacParameter(torch.randn((out_length,total_in_length)) * 0.01,requires_grad)
+        self.bias = JacParameter(torch.zeros((out_length,)),requires_grad)
 
     def forward(self, *args):
         assert len(args) == len(self.in_lengths), f'wrong number of args, got {len(args)} args, want {len(self.in_lengths)}'

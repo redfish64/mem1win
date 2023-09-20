@@ -311,12 +311,33 @@ def match_dims(a,b,add_on_left=False):
         view_args = list(a.shape) + [1] * (b.dim() - a.dim()) 
     return a.view(*view_args)
     
-def sum_dims(t,num_dims,sum_on_left=False):
-    """
-    sums the dimensions on the left or the right and returns the result
-    """
-
-    if(s
-    return torch.sum(t,list(range(t.dim() - num_dims, t.dim())))
-
+def mult_list(l):
+    t = 1
     
+    for i in l:
+        t = t * i
+
+    return t
+    
+
+def cross_product_batch_ldim_tensors(a,a_split_point,b,b_split_point):
+    """
+    Runs a mat mul against tensors with more than 2 dimensions by defining a split
+    point and then viewing them as two dimensional with a single batch dimension in front.
+    For example if I want to cross product tensors a=(1,3,5,7,9) and b=(1,7,9,2,4,6) I
+    could run cross_product_ldim_tensors(a,3,b,2) and then I would get back a tensor
+    shaped as (1,3,5,2,4,6). Internally a would be converted to the 2d tensor (15,63) and
+    b would be converted to (63,24) and the result converted back.
+    """
+    a_before_split = mult_list(a.shape[1:a_split_point])
+    a_after_split = mult_list(a.shape[a_split_point:])
+
+    b_before_split = mult_list(b.shape[1:b_split_point])
+    b_after_split = mult_list(b.shape[b_split_point:])
+
+    av = a.view(a.shape[0],a_before_split,a_after_split)
+    bv = b.view(b.shape[0],b_before_split,b_after_split)
+
+    res = av @ bv
+
+    return res.view(*(a.shape[0:a_split_point]+b.shape[b_split_point:]))

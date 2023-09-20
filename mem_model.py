@@ -36,12 +36,12 @@ class CausalSelfAttention(nn.Module):
         assert config.n_embd % config.n_head == 0
 
         # key, query, value projections for all heads, but in a batch
-        self.c_attn =     jm.JacLinear(config.n_embd, 3 * config.n_embd, has_bias=config.bias)
+        self.c_attn =     jm.JacLinear(config.n_embd, 3 * config.n_embd, True, has_bias=config.bias)
         # output projection
-        self.c_proj =     jm.JacLinear(config.n_embd, config.n_embd, has_bias=config.bias)
+        self.c_proj =     jm.JacLinear(config.n_embd, config.n_embd, True, has_bias=config.bias)
 
-        self.c_mem_attn = jm.JacLinear(config.n_mem_embd, 3 * config.n_embd, has_bias=config.bias)
-        self.c_mem_proj = jm.JacLinear(config.n_embd, config.n_mem_embd, has_bias=config.bias)
+        self.c_mem_attn = jm.JacLinear(config.n_mem_embd, 3 * config.n_embd, False, has_bias=config.bias)
+        self.c_mem_proj = jm.JacLinear(config.n_embd, config.n_mem_embd, False, has_bias=config.bias)
 
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
@@ -51,18 +51,18 @@ class CausalSelfAttention(nn.Module):
         self.n_mem_embd = config.n_mem_embd
         self.dropout = config.dropout
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        self.flash = (not config.no_flash) and hasattr(torch.nn.functional, 'scaled_dot_product_attention')
 
         total_size = config.block_size + config.n_memory_per_layer
         if not self.flash:
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
             # causal mask to ensure that attention is only applied to the left in the input sequence
-            self.register_buffer("bias",
-                                 torch.tril(torch.ones(config.block_size,total_size),diagonal=config.block_size-1)
+            self.register_buffer("no_flash_attn_mask",
+                                 torch.tril(torch.ones(config.block_size,total_size),diagonal=config.n_memory_per_layer)
                                  .view(1, 1, config.block_size,total_size))
         else:
             self.register_buffer("attn_mask",
-                                 torch.tril(torch.ones(config.block_size,total_size),diagonal=config.block_size-1)
+                                 torch.tril(torch.ones(config.block_size,total_size),diagonal=config.n_memory_per_layer)
                                  .view(1, 1, config.block_size,total_size)) == 1
 
     def get_jac_params(self):
@@ -97,7 +97,7 @@ class CausalSelfAttention(nn.Module):
         else:
             # manual implementation of attention
             att = (fq @ fk.transpose(-2, -1)) * (1.0 / math.sqrt(fk.size(-1)))
-            att = att.masked_fill(self.attn_mask == 0, float('-inf'))
+            att = att.masked_fill(self.no_flash_attn_mask == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ fv # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
@@ -140,7 +140,8 @@ class CausalSelfAttention(nn.Module):
         else:
             # manual implementation of attention
             att = (fq @ fk.transpose(-2, -1)) * (1.0 / math.sqrt(fk.size(-1)))
-            att = att.masked_fill(self.attn_mask == 0, float('-inf'))
+            #there is no mask for _calc_mem_out because we are dealing with memory grad changes which will
+            #take effect next cycle.
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ fv # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
@@ -157,11 +158,11 @@ class CausalSelfAttention(nn.Module):
         
 class MLP(nn.Module):
 
-    def __init__(self, config, n_embd):
+    def __init__(self, config, n_embd,requires_grad):
         super().__init__()
-        self.c_fc    = jm.JacLinear(n_embd, 4 * n_embd, has_bias=config.bias)
+        self.c_fc    = jm.JacLinear(n_embd, 4 * n_embd, requires_grad, has_bias=config.bias)
         self.gelu    = nn.GELU()
-        self.c_proj  = jm.JacLinear(4 * n_embd, n_embd, has_bias=config.bias)
+        self.c_proj  = jm.JacLinear(4 * n_embd, n_embd, requires_grad, has_bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
     def get_jac_params(self):
@@ -181,24 +182,25 @@ class Block(nn.Module):
         self.memory = jm.JacParameter(torch.zeros((config.batch_size,
                                                    config.n_memory_per_layer,
                                                    config.n_mem_embd)),
-                                      is_batch_indexed=True,
-                                      requires_grad=True)
+                                      True,
+                                      is_batch_indexed=True)
+                                      
 
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.mem_ln_1 = LayerNorm(config.n_mem_embd, bias=config.bias)
         self.attn = CausalSelfAttention(self.memory,config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mem_ln_2 = LayerNorm(config.n_mem_embd, bias=config.bias)
-        self.mlp = MLP(config,config.n_embd)
-        self.mem_mlp = MLP(config,config.n_mem_embd)
+        self.mlp = MLP(config,config.n_embd,True)
+        self.mem_mlp = MLP(config,config.n_mem_embd,False)
         self.jac_grad_decay = config.jac_grad_decay
     def forward(self, x):
-        x = x + self.attn(self.mem_ln_1(self.memory),self.ln_1(x))
+        x = x + self.attn(self.mem_ln_1(jm.get_jac_param(self.memory)),self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
 
     def _calc_mem_out(self,x):
-        m = self.memory + self.attn._calc_mem_out(self.mem_ln_1(self.memory),self.ln_1(x))
+        m = jm.get_jac_param(self.memory) + self.attn._calc_mem_out(self.mem_ln_1(jm.get_jac_param(self.memory)),self.ln_1(x))
         m = m + self.mem_mlp(self.mem_ln_2(m))
         return m
 
@@ -247,6 +249,7 @@ class GPTConfig:
     batch_size: int = 8
     n_memory_per_layer: int = 8
     jac_grad_decay: float = 0.01
+    no_flash: bool = False 
 
 class GPT(nn.Module):
 
@@ -335,8 +338,9 @@ class GPT(nn.Module):
         return logits, loss, last_item_loss
 
     def update_memory_and_mem_params(self):
-        for block,x in zip(self.transformer.h,self.last_block_xs):
-            block.update_memory_and_mem_params(x)
+        with torch.no_grad():
+            for block,x in zip(self.transformer.h,self.last_block_xs):
+                block.update_memory_and_mem_params(x)
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
@@ -410,7 +414,7 @@ class GPT(nn.Module):
         # start with all of the candidate parameters
         param_dict = {pn: p for pn, p in self.named_parameters()}
         # filter out those that do not require grad
-        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad or isinstance(p,jm.JacParameter)}
         # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
         # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
         decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
