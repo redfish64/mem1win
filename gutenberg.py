@@ -10,6 +10,7 @@ def dirty_convert_utf8(data):
 def get_etext(zip_filename,min_size=0,max_size=None,start_cutoff_regex=None,end_cutoff_regex=None):
     with ZipFile(zip_filename) as myzip:
         il = myzip.infolist()
+        il = [a for a in il if a.filename[-1] != '/'] #ignore dirs
         if(len(il) != 1):
             return None,None,f'Expected exactly 1 file in zip, got {len(il)}'
         filename = il[0].filename

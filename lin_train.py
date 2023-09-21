@@ -109,7 +109,7 @@ class WorkLoader():
     indexed position. 
     """
 
-    def __init__(self,enc,works_read_set,iter_fn,batch_size,block_size,num_loops,device, pre_start_token,post_end_token,min_size=0,max_size=None,offset_loops=True,trailing_empty_blocks=1):
+    def __init__(self,enc,works_read_set,iter_fn,batch_size,block_size,num_loops,device, pre_start_token,post_end_token,min_size=0,max_size=None,offset_loops=True,trailing_empty_blocks=1,update_global_stats=True):
         """
         Parameters:
         iter_fn: a function that returns an iterator over the works to read. It can be called more than once for multiple runs
@@ -143,6 +143,7 @@ class WorkLoader():
         self.trailing_empty_blocks = trailing_empty_blocks
         self.pre_start_token = pre_start_token
         self.post_end_token = post_end_token
+        self.update_global_stats = update_global_stats
         
     def _read_next_work(self):
         """
@@ -160,14 +161,16 @@ class WorkLoader():
                 logging.info('No more works, and at end of loops')
                 return None
 
-            stats.n_works_read = 0
             
             logging.info(f'At end of works, restarting iterator, loop {self.curr_loop} out of {self.num_loops}')
+            if(self.update_global_stats):
+                stats.n_works_read = 0
             self.works_read_set = {}
             self.iter = self.iter_fn()
             return self._read_next_work()
 
-        stats.n_works_read += 1
+        if(self.update_global_stats):
+            stats.n_works_read += 1
 
         #TODO 2.8 set disallowed_special to set() to allow special tokens since we have dirty data. Need to
         # find out how special tokens are encoded and strip them from the input
@@ -189,6 +192,11 @@ class WorkLoader():
         new_dict['current_work_bp'] = [cw.block_pos for cw in self.current_works]
 
         return new_dict
+
+    def reset(self):
+        self.works_read_set = {}
+        self.iter = self.iter_fn()
+        self.curr_loop=0
 
     # MUST be called after loading a previous save
     def init_after_load(self,enc,iter_fn):
@@ -267,10 +275,14 @@ class WorkLoader():
 
                 return out
 
+            if cw is None:
+                block = torch.full((self.block_size,),self.post_end_token,device=self.device)
+                target = torch.full((self.block_size,),self.post_end_token,device=self.device)
+            else:
+                block = get_block_data(cw.data,token_pos,token_pos + self.block_size)
+                target = get_block_data(cw.data,token_pos+1,token_pos+1 + self.block_size)
+                self.current_works[i].block_pos += 1
 
-            block = get_block_data(cw.data,token_pos,token_pos + self.block_size)
-            target = get_block_data(cw.data,token_pos+1,token_pos+1 + self.block_size)
-            self.current_works[i].block_pos += 1
             batch_list.append(block)
             target_list.append(target)
 
@@ -278,7 +290,7 @@ class WorkLoader():
         if(n_works_finished == self.batch_size):
             raise StopIteration
 
-        return ([cw.block_pos for cw in self.current_works],
+        return ([(0 if cw is None else cw.block_pos) for cw in self.current_works],
                 torch.stack(batch_list,dim=0),
                 torch.stack(target_list,dim=0),
                 )
@@ -361,12 +373,15 @@ def create_model_state(enc,config):
     m = model.GPT(gptconf)
     m.to(config.device)
     
-    wl = WorkLoader(enc,{},create_files_iter_fn(config.dir_tree),config.batch_size,config.block_size,config.n_loops,config.device,config.pre_start_token,config.post_end_token,config.min_text_size,config.max_text_size)
+    wl = WorkLoader(enc,{},create_files_iter_fn(config.dir_tree),config.batch_size,config.block_size,config.n_loops,config.device,config.pre_start_token,config.post_end_token,config.min_text_size,config.max_text_size,update_global_stats=True)
 
     optimizer = m.configure_optimizers(config.weight_decay, config.learning_rate, (config.beta1, config.beta2), config.device)
 
     if(config.test_dir_tree is not None):
-        test_wl = WorkLoader(enc,{},create_files_iter_fn(config.test_dir_tree),config.batch_size,config.block_size,1,config.device,config.pre_start_token,config.post_end_token,config.min_text_size,config.max_text_size)
+        #TODO 3 HACK we are limiting the batch size to 1, since if there aren't enough files to fill all the batches
+        #then WorkLoader will return empty batch items for the missing ones which can really screw up the
+        #estimated loss
+        test_wl = WorkLoader(enc,{},create_files_iter_fn(config.test_dir_tree),1,config.block_size,1,config.device,config.pre_start_token,config.post_end_token,config.min_text_size,config.max_text_size,update_global_stats=False)
     else:
         test_wl = None
 
@@ -472,8 +487,11 @@ def est_loss(ms,config):
 
         test_batch_size = len(list(ms.test_wl.iter_fn()))
         ms.mdl.reset_memory(test_batch_size)
+
+        ms.test_wl.reset()
+
         for idx,(block_pos_list,batch,targets) in enumerate(ms.test_wl):
-            logits,loss,last_item_loss = ms.mdl(batch,targets)
+            logits,loss,last_item_loss = ms.mdl(batch,targets,compute_last_loss=True)
             total_loss += loss.item()
             total_last_item_loss += last_item_loss.item()
             total_iters += 1

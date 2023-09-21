@@ -283,6 +283,16 @@ class GPT(nn.Module):
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
+    def save_memory(self):
+        print('HACK TODO save_memory!!!!')
+        return "foo"
+
+    def reset_memory(self,batch_size):
+        print('HACK TODO reset_memory!!!!')
+
+    def restore_memory(self,saved_memory):
+        print('HACK TODO restore_memory!!!!')
+
     def get_num_params(self, non_embedding=True):
         """
         Return the number of parameters in the model.
