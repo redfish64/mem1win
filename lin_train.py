@@ -74,23 +74,6 @@ def print_status(ms,time_between_updates, trailing_avg_perc, loss=None, last_ite
 
     return True
 
-def read_next_valid_work(works_read_set,iter,min_size=0,max_size=None):
-    for zf in iter:
-        logging.debug(f'Looking at {zf}')
-        if(zf in works_read_set):
-            logging.info(f'Skipping {zf} since already read')
-            continue
-
-        data,fn,error = gutenberg.get_etext(zf,min_size,max_size)
-        if(data is None):
-            logging.info(f'Skipping {zf}: {error}')
-            continue
-
-        logging.info(f'Reading {zf}, {fn}: {data[:100]}...')
-
-        return data,zf,fn
-    return None,None,None
-
 class CurrentWork():
     #data: the text of the work
     #zf: the zip file name
@@ -101,6 +84,47 @@ class CurrentWork():
         self.fn = fn
         self.block_pos = 0
         self.offset = offset
+
+class SingleRandomWorkLoader():
+    """
+    loads batches in random order from a single file
+    """
+
+    def __init__(self,enc,zf,batch_size,block_size,num_loops,device):
+        self.enc = enc
+        self.zf = zf
+        self.batch_size = batch_size
+        self.block_size = block_size
+        self.device = device
+        data,_,_ = gutenberg.get_etext(zf)
+
+        #choose an approx number of batches that match number of loops for non random training
+        self.num_batches = num_loops * len(data) // self.block_size // self.batch_size
+        self.data_tensor = torch.tensor(self.enc.encode(data),device=self.device)
+        self.curr_loop = 0
+        
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if(self.curr_loop >= self.num_batches):
+            raise StopIteration
+
+        self.curr_loop += 1
+
+        ix = torch.randint(self.data_tensor.shape[0] - self.block_size, (self.batch_size,))
+
+        # Extract sequences starting at the random indices
+        input_data = [self.data_tensor[start:start+self.block_size] for start in ix]
+        input_data = torch.stack(input_data)
+
+        # Create target sequences: they are the same as input sequences but shifted by one token
+        target_data = [self.data_tensor[start+1:start+self.block_size+1] for start in ix]
+        target_data = torch.stack(target_data)
+
+        return (ix // self.block_size).tolist(), input_data.to(self.device), target_data.to(self.device)
+
+
 
 #
 class WorkLoader():
@@ -144,7 +168,25 @@ class WorkLoader():
         self.pre_start_token = pre_start_token
         self.post_end_token = post_end_token
         self.update_global_stats = update_global_stats
-        
+
+    @staticmethod
+    def _read_next_valid_work(works_read_set,iter,min_size=0,max_size=None):
+        for zf in iter:
+            logging.debug(f'Looking at {zf}')
+            if(zf in works_read_set):
+                logging.info(f'Skipping {zf} since already read')
+                continue
+
+            data,fn,error = gutenberg.get_etext(zf,min_size,max_size)
+            if(data is None):
+                logging.info(f'Skipping {zf}: {error}')
+                continue
+
+            logging.info(f'Reading {zf}, {fn}: {data[:100]}...')
+
+            return data,zf,fn
+        return None,None,None
+
     def _read_next_work(self):
         """
         Reads the next work in current_works and updates curr_loop and stats. If there are no works left, restarts as
@@ -154,7 +196,7 @@ class WorkLoader():
         global stats
         if(self.curr_loop == self.num_loops): # if we are already tried to read another work and there are none
             return None
-        next_work,zf,fn = read_next_valid_work(self.works_read_set,self.iter,self.min_size,self.max_size)
+        next_work,zf,fn = WorkLoader._read_next_valid_work(self.works_read_set,self.iter,self.min_size,self.max_size)
         if(next_work is None):
             self.curr_loop += 1
             if(self.curr_loop == self.num_loops):
@@ -315,7 +357,11 @@ def init_argparse() -> argparse.ArgumentParser:
     shared_parser.add_argument('--device', nargs='?', default="cpu",help='device to run on (cpu or cuda)')
 
     train_parser = subparsers.add_parser("train", help="Train a new or existing model", parents=[shared_parser])
-    train_parser.add_argument('--dir_tree',required=True,help='directory tree to look for zipped text files for training')
+
+    train_data_group = train_parser.add_mutually_exclusive_group(required=True)
+    train_data_group.add_argument('--dir_tree',help='directory tree to look for zipped text files for training')
+    train_data_group.add_argument('--single_train_file',help='single zipped file of training data. Don\'t make this too big, it\'s loaded into memory all at once.')
+
     train_parser.add_argument('--batch_size', nargs='?', type=int,default=64,help='num of batches to process at once')
     train_parser.add_argument('--block_size', nargs='?', type=int,default=256,help='block size in tokens. This along with memory_size decides the number of input params')
     train_parser.add_argument('--n_loops', nargs='?', type=int,default=100,help='number of times to loop through data')
@@ -335,6 +381,7 @@ def init_argparse() -> argparse.ArgumentParser:
     train_parser.add_argument('--no_save', action='store_true',help='won\'t save the model automatically. The model can still be saved by interrupt')
     train_parser.add_argument('--no_bias', action='store_true',help='GPT param, whether to have a bias or not. GPT creator seems to think it\'s better not to have')
     train_parser.add_argument('--no_flash', action='store_true',help='True if scaled_dot_product_attention function shouldn\'t be used even if available')
+    train_parser.add_argument('--random_batches', action='store_true',help='True if we want to use random batches rather than go through the data sequentially. This will of course make the memory useless')
     train_parser.add_argument('--learning_rate', nargs='?',type=float,default=6e-4,help='learning rate for optimizer')
     train_parser.add_argument('--weight_decay', nargs='?',type=float,default=1e-1,help='GPT module parameter to try and force the weights closer to zero')
     train_parser.add_argument('--jac_grad_decay', nargs='?',type=float,default=0.01,help='Amount to decay the effect of the previous cycles grads on the current learning step. From 0.0 to 1.0')
@@ -361,7 +408,8 @@ class ModelState(NamedTuple):
 def create_files_iter_fn(dt):
     return lambda: glob.iglob(f'{dt}/**/*.zip',recursive=True)
 
-def create_model_state(enc,config):
+
+def create_model_state(enc,parser,config):
 
     #max_token_value is one less than the vocab size as far as I can tell, see:
     #https://github.com/openai/tiktoken/blob/7830ed537badecefb5a357448be722bfd58f9fca/tiktoken/core.py
@@ -372,8 +420,15 @@ def create_model_state(enc,config):
                               no_flash=config.no_flash)
     m = model.GPT(gptconf)
     m.to(config.device)
-    
-    wl = WorkLoader(enc,{},create_files_iter_fn(config.dir_tree),config.batch_size,config.block_size,config.n_loops,config.device,config.pre_start_token,config.post_end_token,config.min_text_size,config.max_text_size,update_global_stats=True)
+
+    if(config.random_batches):
+        if config.single_train_file is None:
+            parser.error("--single_train_file is required when --random_batches is set.")
+        wl = SingleRandomWorkLoader(enc,config.single_train_file,config.batch_size,config.block_size,config.n_loops,config.device)
+    else:
+        if config.dir_tree is None:
+            parser.error("--dir_tree is required when --random_batches is false.")
+        wl = WorkLoader(enc,{},create_files_iter_fn(config.dir_tree),config.batch_size,config.block_size,config.n_loops,config.device,config.pre_start_token,config.post_end_token,config.min_text_size,config.max_text_size,update_global_stats=True)
 
     optimizer = m.configure_optimizers(config.weight_decay, config.learning_rate, (config.beta1, config.beta2), config.device)
 
@@ -552,7 +607,7 @@ def main():
         print(f"loading model {config.load_model}")
         (ms,stats) = load_model_state(config.load_model,enc,config)
     else:
-        ms = create_model_state(enc,config)
+        ms = create_model_state(enc,parser,config)
 
     print(sum(p.numel() for p in ms.mdl.parameters())/1e6, 'M parameters')
     if(config.bos):
