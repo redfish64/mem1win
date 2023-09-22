@@ -576,8 +576,8 @@ def run_training(config,enc,ms):
     for idx,(block_pos_list,batch,targets) in enumerate(ms.wl):
         with util.DelayedKeyboardInterrupt(save_and_intr,eat_interrupt=True):
             for index,bp in enumerate(block_pos_list):
-                if(bp == 0):
-                    ms.mdl_reset_memory_for_item_in_batch(index)
+                if(bp == 0 and not config.random_batches):
+                    ms.mdl.reset_memory_for_item_in_batch(index)
                     
             logits,loss,last_item_loss = ms.mdl(batch,targets)
             ms.optimizer.zero_grad(set_to_none=True)

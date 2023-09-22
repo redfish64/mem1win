@@ -293,6 +293,10 @@ class GPT(nn.Module):
     def restore_memory(self,saved_memory):
         print('HACK TODO restore_memory!!!!')
 
+    def reset_memory_for_item_in_batch(index):
+        print('HACK TODO reset_memory_for_item_in_batch!!!!')
+
+        
     def get_num_params(self, non_embedding=True):
         """
         Return the number of parameters in the model.
