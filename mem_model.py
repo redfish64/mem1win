@@ -81,7 +81,7 @@ class CausalSelfAttention(nn.Module):
         _,mT,mC = mem.size()
 
         #PERF we are calculating mq here but not using it.
-        _, mk, mv = self.c_mem_attn(mem).split(self.n_embd, dim=2)
+        _, mk, mv = self.c_mem_attn(mem[0:B]).split(self.n_embd, dim=2)
         mk = mk.view(B, mT, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         mv = mv.view(B, mT, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
@@ -194,6 +194,10 @@ class Block(nn.Module):
         self.mlp = MLP(config,config.n_embd,True)
         self.mem_mlp = MLP(config,config.n_mem_embd,False)
         self.jac_grad_decay = config.jac_grad_decay
+        self.batch_size = config.batch_size
+        self.n_memory_per_layer = config.n_memory_per_layer
+        self.n_mem_embd = config.n_mem_embd
+
     def forward(self, x):
         x = x + self.attn(self.mem_ln_1(jm.get_jac_param(self.memory)),self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
@@ -234,7 +238,21 @@ class Block(nn.Module):
         #(maybe shouldn't do this here, it's weird, but where else?)
         self.memory.grad = None
 
+    def save_memory(self):
+        """Returns current memory for running estimated loss, etc. """
+        return self.memory
 
+    def reset_memory(self):
+        with torch.no_grad():
+            self.memory *= 0.
+
+        
+    def restore_memory(self,mem):
+        self.memory = mem
+
+    def reset_memory_for_item_in_batch(self,index):
+        with torch.no_grad():
+            self.memory[index] *= 0.
 
 @dataclass
 class GPTConfig:
@@ -284,17 +302,19 @@ class GPT(nn.Module):
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
     def save_memory(self):
-        print('HACK TODO save_memory!!!!')
-        return "foo"
+        return [b.save_memory() for b in self.transformer.h]
 
-    def reset_memory(self,batch_size):
-        print('HACK TODO reset_memory!!!!')
+    def reset_memory(self):
+        for b in self.transformer.h:
+            b.reset_memory()
 
     def restore_memory(self,saved_memory):
-        print('HACK TODO restore_memory!!!!')
+        for s,b in zip(saved_memory,self.transformer.h):
+            b.restore_memory(s)
 
-    def reset_memory_for_item_in_batch(index):
-        print('HACK TODO reset_memory_for_item_in_batch!!!!')
+    def reset_memory_for_item_in_batch(self,index):
+        for b in self.transformer.h:
+            b.reset_memory_for_item_in_batch(index)
 
         
     def get_num_params(self, non_embedding=True):

@@ -488,7 +488,7 @@ def imagine_rest_of_story(enc,ms,zf,perc=0.5,context_token_length=150,n_output=1
         
         wli = iter(WorkLoader(enc,{},create_single_file_iter_fn(),1,config.block_size,1,
                               config.device,config.pre_start_token,config.post_end_token,config.min_text_size,config.max_text_size))
-        ms.mdl.reset_memory(1)
+        ms.mdl.reset_memory()
 
         print(f'Reading story {zf}...')
 
@@ -540,8 +540,7 @@ def est_loss(ms,config):
         total_loss = 0.0
         total_last_item_loss = 0.0
 
-        test_batch_size = len(list(ms.test_wl.iter_fn()))
-        ms.mdl.reset_memory(test_batch_size)
+        ms.mdl.reset_memory()
 
         ms.test_wl.reset()
 
