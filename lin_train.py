@@ -20,32 +20,34 @@ import gutenberg
 
 
 class ModelTrailingAvgStats:
-    def __init__(self):
+    def __init__(self,trailing_avg_perc):
         self.u_block_pos = None
         self.u_max_block_pos = None
         self.loss = None
         self.last_item_loss = None
+        self.trailing_avg_perc = trailing_avg_perc
+        self.stat_vals = {}
 
-    def update_ta(self, perc, name, val):
-        if self.__dict__[name] is None:
-            self.__dict__[name] = val
+    def update_ta(self, name, val):
+        if not (name in self.stat_vals):
+            self.stat_vals[name] = val
         else:
-            self.__dict__[name] = val * perc + self.__dict__[name] * (1.0-perc)
+            self.stat_vals[name] = val * self.trailing_avg_perc + self.stat_vals[name] * (1.0-self.trailing_avg_perc)
 
 class ModelStats:
-    def __init__(self):
+    def __init__(self,trailing_avg_perc):
         #last time print_status printed a message
         self.last_print_time = 0.0
         self.last_save_time = 0.0
         self.last_est_loss_time = 0.0
         self.n_batches_trained = 0
         self.n_works_read = 0
-        self.tas = ModelTrailingAvgStats()
+        self.tas = ModelTrailingAvgStats(trailing_avg_perc)
  
-stats = ModelStats()
+stats = None
 
 # trailing_avg_perc: amount of the past to keep, so should be closer to 0.99 than 0.01
-def print_status(ms,time_between_updates, trailing_avg_perc, loss=None, last_item_loss=None):
+def print_status(ms,time_between_updates, stat_vals):
     #yes we use global variables here, but this is just for displaying status
     global stats
     #last_print_time, trailing_avg_loss, trailing_avg_query_loss, n_batches_trained
@@ -53,12 +55,9 @@ def print_status(ms,time_between_updates, trailing_avg_perc, loss=None, last_ite
     curr_time = time.time()
     stats.n_batches_trained += 1
 
-    # stats.tas.update_ta(trailing_avg_perc,'u_block_pos', u_block_pos)
-    # stats.tas.update_ta(trailing_avg_perc,'u_max_block_pos', u_max_block_pos)
-    if(loss is not None):
-        stats.tas.update_ta(trailing_avg_perc,'loss', loss.item())
-    if(last_item_loss is not None):
-        stats.tas.update_ta(trailing_avg_perc,'last_item_loss', last_item_loss.item())
+    for n,v in stat_vals.items():
+        if(v is not None):
+            stats.tas.update_ta(n,v)
 
     if(curr_time - stats.last_print_time < time_between_updates):
         return False
@@ -68,9 +67,18 @@ def print_status(ms,time_between_updates, trailing_avg_perc, loss=None, last_ite
     def format_loss(v):
         if(v is None):
             return "None"
-        return f'{v:8.4f}'
+        if(abs(v) < 1e-3):
+            return f'{v:1.3e}'
+        return f'{v:1.6f}'
+
+    def format_stats(name,stats):
+        out = ''
+        for k,v in stats.items():
+            out += f'{k}: {format_loss(v)} '
+
+        return f'({name}::{out})'
     
-    print(f'works_read: {stats.n_works_read}, batches_trained: {stats.n_batches_trained:8} loss: {format_loss(loss)}, last_item_loss: {format_loss(last_item_loss)} trailing_loss: {format_loss(stats.tas.loss)} trailing_last_item_loss: {format_loss(stats.tas.last_item_loss)}')
+    print(f'works_read: {stats.n_works_read}, batches_trained: {stats.n_batches_trained:8} {format_stats("curr",stat_vals)} {format_stats("trailing",stats.tas.stat_vals)}')
 
     return True
 
@@ -375,7 +383,7 @@ def init_argparse() -> argparse.ArgumentParser:
     train_parser.add_argument('--max_text_size', nargs='?', type=int,default=1024*1024*10,help='max size of text files to process (others will be skipped)')
     train_parser.add_argument('--trailing_avg_perc', nargs='?', type=float,default=0.01,help='only used for display. When printing status, we use a trailing avg. This is the percentage to keep from the previous runs, the remainder is for the current one.')
     train_parser.add_argument('--test_dir_tree',nargs='?',help='directory tree to look for zipped text files for testing. All of these files will be run to estimate loss so don\'t add too many here')
-    train_parser.add_argument('--print_status', nargs='?',type=float,default=10,help='time between printing status updates and estimating loss in seconds')
+    train_parser.add_argument('--print_status_time', nargs='?',type=float,default=10,help='time between printing status updates and estimating loss in seconds')
     train_parser.add_argument('--save_model_time', nargs='?',type=float,default=60*15,help='time between saving the model in seconds')
     train_parser.add_argument('--est_loss_time', nargs='?',type=float,default=60,help='time between estimating the loss of the model in seconds')
     train_parser.add_argument('--no_save', action='store_true',help='won\'t save the model automatically. The model can still be saved by interrupt')
@@ -385,6 +393,7 @@ def init_argparse() -> argparse.ArgumentParser:
     train_parser.add_argument('--learning_rate', nargs='?',type=float,default=6e-4,help='learning rate for optimizer')
     train_parser.add_argument('--weight_decay', nargs='?',type=float,default=1e-1,help='GPT module parameter to try and force the weights closer to zero')
     train_parser.add_argument('--jac_grad_decay', nargs='?',type=float,default=0.01,help='Amount to decay the effect of the previous cycles grads on the current learning step. From 0.0 to 1.0')
+    train_parser.add_argument('--mem_grad_multiplier', nargs='?',type=float,default=1,help='Multiples the memory gradiants by this value before optimizing.')
     train_parser.add_argument('--beta1', nargs='?',type=float,default=0.9,help='AdamW parameter to control running average for momentum')
     train_parser.add_argument('--beta2', nargs='?',type=float,default=0.95,help='AdamW parameter to control running average for momentum')
     train_parser.add_argument('--load_model', nargs='?',help='load a previously generated model')
@@ -417,7 +426,8 @@ def create_model_state(enc,parser,config):
                               n_head=config.n_head,n_mem_embd=config.n_mem_embd,n_embd=config.n_embd,dropout=config.dropout,bias=not config.no_bias,
                               batch_size=config.batch_size,n_memory_per_layer=config.n_memory_per_layer,
                               jac_grad_decay=config.jac_grad_decay,
-                              no_flash=config.no_flash)
+                              no_flash=config.no_flash,
+                              mem_grad_multiplier=config.mem_grad_multiplier)
     m = model.GPT(gptconf)
     m.to(config.device)
 
@@ -569,8 +579,19 @@ def run_training(config,enc,ms):
         save_model_state(ms,stats)
         pdb.set_trace()
 
-    
+    def get_avg_abs_grad(params):
+        tag = 0.
+        cnt = 0 
+        for p in params:
+            if(p.grad is not None):
+                ag = p.grad.abs().mean().item()
+                tag += ag
+                cnt += 1
 
+        return tag / cnt
+
+    global stats
+    stats = ModelStats(config.trailing_avg_perc)                        
     stats.last_save_time = time.time()
     for idx,(block_pos_list,batch,targets) in enumerate(ms.wl):
         with util.DelayedKeyboardInterrupt(save_and_intr,eat_interrupt=True):
@@ -582,8 +603,15 @@ def run_training(config,enc,ms):
             ms.optimizer.zero_grad(set_to_none=True)
             loss.backward()
             ms.mdl.update_memory_and_mem_params()
+            mem_avg_grad = get_avg_abs_grad(ms.mdl.get_mem_params())
+            out_avg_grad = get_avg_abs_grad(ms.mdl.get_out_params())
             ms.optimizer.step() # TODO 2 make sure that optimizer has right params
-            print_status(ms,config.print_status,config.trailing_avg_perc,loss,last_item_loss)
+
+            print_status(ms,config.print_status_time,
+                         {'loss' : loss,
+                          'last_item_loss' : last_item_loss,
+                          'mem_avg_grad' : mem_avg_grad,
+                          'out_avg_grad' : out_avg_grad})
             
             if(time.time() - stats.last_save_time >= config.save_model_time):
                 save_model_state(ms,stats)

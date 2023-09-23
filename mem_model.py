@@ -65,9 +65,13 @@ class CausalSelfAttention(nn.Module):
                                  torch.tril(torch.ones(config.block_size,total_size),diagonal=config.n_memory_per_layer)
                                  .view(1, 1, config.block_size,total_size)) == 1
 
-    def get_jac_params(self):
+    def get_mem_params(self):
         return (self.c_mem_attn.get_jac_params() +
                 self.c_mem_proj.get_jac_params())
+        
+    def get_out_params(self):
+        return (self.c_attn.get_jac_params() +
+                self.c_proj.get_jac_params())
         
     def forward(self, mem, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
@@ -197,6 +201,7 @@ class Block(nn.Module):
         self.batch_size = config.batch_size
         self.n_memory_per_layer = config.n_memory_per_layer
         self.n_mem_embd = config.n_mem_embd
+        self.mem_grad_multiplier = torch.tensor(config.mem_grad_multiplier)
 
     def forward(self, x):
         x = x + self.attn(self.mem_ln_1(jm.get_jac_param(self.memory)),self.ln_1(x))
@@ -209,9 +214,12 @@ class Block(nn.Module):
         return m
 
     def get_mem_params(self):
-        return (self.attn.get_jac_params() +
-                self.mem_mlp.get_jac_params() +
-                [self.memory])
+        return (self.attn.get_mem_params() +
+                self.mem_mlp.get_jac_params())
+        
+    def get_out_params(self):
+        return (self.attn.get_out_params() +
+                self.mlp.get_jac_params())
         
     def update_memory_and_mem_params(self,x):
         """
@@ -219,9 +227,9 @@ class Block(nn.Module):
         Also sets memory.grad to None
         x - x is the previous input used for forward()
         """
-        jac_params = self.get_mem_params()
+        jac_params = self.get_mem_params() + [self.memory]
 
-        #vmap_randomness is cause scaled_dot_product_attention does randomness. Why? dunno.
+        #vmap_randomness is because scaled_dot_product_attention does randomness. Why? dunno.
         new_mem = jm.jac_grad(self._calc_mem_out,x,jac_params,fake_one_row_batch=True,vmap_randomness='different')
 
         for jp in jac_params:
@@ -230,6 +238,7 @@ class Block(nn.Module):
             #orig:
             jp.grad = jp.calc_grad_from_running_jac_grad(self.memory.grad)
             jp.update_running_jac_grad(self.jac_grad_decay,self.memory.jac_grad)
+            jp.grad *= self.mem_grad_multiplier 
         
         self.memory.copy_(new_mem)
 
@@ -268,6 +277,7 @@ class GPTConfig:
     n_memory_per_layer: int = 8
     jac_grad_decay: float = 0.01
     no_flash: bool = False 
+    mem_grad_multiplier: float = 1.0
 
 class GPT(nn.Module):
 
@@ -300,6 +310,12 @@ class GPT(nn.Module):
 
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
+
+    def get_mem_params(self):
+        return [hp for h in self.transformer.h for hp in h.get_mem_params()]
+        
+    def get_out_params(self):
+        return [hp for h in self.transformer.h for hp in h.get_out_params()]
 
     def save_memory(self):
         return [b.save_memory() for b in self.transformer.h]
