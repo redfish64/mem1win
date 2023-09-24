@@ -111,7 +111,6 @@ class CausalSelfAttention(nn.Module):
         # output projection
         y = self.resid_dropout(self.c_proj(y))
 
-        self.last_input = x
         return y
 
     def _calc_mem_out(self,mem,x):
@@ -247,9 +246,13 @@ class Block(nn.Module):
         #(maybe shouldn't do this here, it's weird, but where else?)
         self.memory.grad = None
 
-    def save_memory(self):
-        """Returns current memory for running estimated loss, etc. """
-        return self.memory
+    def save_and_reset_memory(self):
+        """Returns current memory for running estimated loss, etc. and creates a clone all zeroed out """
+        old_mem = self.memory
+        self.memory = jm.JacParameter(torch.zeros_like(self.memory),
+                                      True,
+                                      is_batch_indexed=True)
+        return old_mem
 
     def reset_memory(self):
         with torch.no_grad():
@@ -317,8 +320,8 @@ class GPT(nn.Module):
     def get_out_params(self):
         return [hp for h in self.transformer.h for hp in h.get_out_params()]
 
-    def save_memory(self):
-        return [b.save_memory() for b in self.transformer.h]
+    def save_and_reset_memory(self):
+        return [b.save_and_reset_memory() for b in self.transformer.h]
 
     def reset_memory(self):
         for b in self.transformer.h:

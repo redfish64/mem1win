@@ -544,13 +544,11 @@ def est_loss(ms,config):
         logging.info('not estimating loss because no test_dir_tree specified')
         return
     with torch.no_grad():
-        saved_model_memory = ms.mdl.save_memory()
+        saved_model_memory = ms.mdl.save_and_reset_memory()
 
         total_iters = 0
         total_loss = 0.0
         total_last_item_loss = 0.0
-
-        ms.mdl.reset_memory()
 
         ms.test_wl.reset()
 
