@@ -152,7 +152,7 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().view(B, mem.shape[1], C) # re-assemble all head outputs side by side
 
         # output projection
-        new_mem = self.resid_dropout(self.c_mem_proj(y))
+        new_mem = self.c_mem_proj(y)
 
         return new_mem
        
