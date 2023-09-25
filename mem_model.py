@@ -208,8 +208,8 @@ class Block(nn.Module):
         return x
 
     def _calc_mem_out(self,x):
-        m = jm.get_jac_param(self.memory) + self.attn._calc_mem_out(self.mem_ln_1(jm.get_jac_param(self.memory)),self.ln_1(x))
-        m = m + self.mem_mlp(self.mem_ln_2(m))
+        m = self.attn._calc_mem_out(self.mem_ln_1(jm.get_jac_param(self.memory)),self.ln_1(x))
+        m = self.mem_mlp(self.mem_ln_2(m))
         return m
 
     def get_mem_params(self):
