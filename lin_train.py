@@ -76,7 +76,7 @@ def print_status(ms,time_between_updates, stat_vals):
         for k,v in stats.items():
             out += f'{k}: {format_loss(v)} '
 
-        return f'({name}::{out})'
+        return f'\n({name}::{out})'
     
     print(f'works_read: {stats.n_works_read}, batches_trained: {stats.n_batches_trained:8} {format_stats("curr",stat_vals)} {format_stats("trailing",stats.tas.stat_vals)}')
 
@@ -603,13 +603,16 @@ def run_training(config,enc,ms):
             ms.mdl.update_memory_and_mem_params()
             mem_avg_grad = get_avg_abs_grad(ms.mdl.get_mem_params())
             out_avg_grad = get_avg_abs_grad(ms.mdl.get_out_params())
+            memory_vec_lengths = [torch.norm(b.memory).item() for b in ms.mdl.transformer.h]
+            avg_memory_vec_length = sum(memory_vec_lengths)/len(memory_vec_lengths)
             ms.optimizer.step() # TODO 2 make sure that optimizer has right params
 
             print_status(ms,config.print_status_time,
                          {'loss' : loss,
                           'last_item_loss' : last_item_loss,
                           'mem_avg_grad' : mem_avg_grad,
-                          'out_avg_grad' : out_avg_grad})
+                          'out_avg_grad' : out_avg_grad,
+                          'avg_mem_vec' : avg_memory_vec_length})
             
             if(time.time() - stats.last_save_time >= config.save_model_time):
                 save_model_state(ms,stats)
