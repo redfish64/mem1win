@@ -340,7 +340,7 @@ class WorkLoader():
         if(n_works_finished == self.batch_size):
             raise StopIteration
 
-        return ([(0 if cw is None else cw.block_pos) for cw in self.current_works],
+        return ([(0 if cw is None else cw.block_pos-1) for cw in self.current_works],
                 torch.stack(batch_list,dim=0),
                 torch.stack(target_list,dim=0),
                 )
