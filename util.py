@@ -312,6 +312,9 @@ def match_dims(a,b,add_on_left=False):
     return a.view(*view_args)
     
 def mult_list(l):
+    """
+    Multiplies together every item in a list and returns the result
+    """
     t = 1
     
     for i in l:
@@ -338,6 +341,6 @@ def cross_product_batch_ldim_tensors(a,a_split_point,b,b_split_point):
     av = a.view(a.shape[0],a_before_split,a_after_split)
     bv = b.view(b.shape[0],b_before_split,b_after_split)
 
-    res = av @ bv
+    res = torch.bmm(av,bv)
 
     return res.view(*(a.shape[0:a_split_point]+b.shape[b_split_point:]))
