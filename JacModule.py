@@ -6,7 +6,7 @@ import torch.func as f
 from dataclasses import dataclass
 import pdb
 import util as u
-
+import itertools
 
 def jac_grad(module, inp_batch, batch_indexed_grad_jac_params, repeated_grad_jac_params, batch_indexed_params, *extra_module_args, vmap_randomness='error', **extra_module_kwargs):
     """
@@ -176,24 +176,31 @@ def test_snake(n_env, n_action, n_mem, n_batches, n_iters, n_test_iters, lr, sta
     # as the loop param
     mem = torch.zeros(n_batches, n_mem, requires_grad=True)
     action = torch.zeros(n_batches, n_action, requires_grad=True)
-    mem_action = torch.cat((mem, action), dim=1)
+    env = torch.zeros(n_batches, n_env, requires_grad=True)
+    mem_action_env = torch.cat((mem, action, env), dim=1)
 
     # this corresponds to the memory the predictor can create to help it predict
-    pred_snake_model = JacLinear(n_env+n_mem+n_action, n_mem)
+    pred_mem_model = JacLinear(n_env+n_mem+n_action, n_mem)
 
-    def pred_snake_loop_fn(in_data):
-        res = pred_snake_model(
-            torch.cat((in_data, get_jac_param(mem), get_jac_param(action)), dim=1))
-        return res
-
-    # the prediction model is trained against whether the current environment is one which causes the agent pain or pleasure
-    # it doesn't get the current environment as input, but only the memory and action, so it can't cheat.
-    pred_win_model = torch.nn.Linear(n_mem+n_action, 1)
-    pred_snake = Snake(pred_snake_loop_fn, list(
-        pred_snake_model.parameters()), mem, [action])
+    # the prediction model tries to predict what the environment will be given the current
+    # memory, action and environment
+    pred_env_model = torch.nn.Linear(n_env+n_mem+n_action, n_env)
 
     # this corresponds to the actions the actor can take
-    actor_snake_model = JacLinear(n_env+n_mem+n_action, n_action)
+    actor_model = JacLinear(n_env+n_mem+n_action, n_action)
+
+    def snake_loop_fn(in_data):
+        models_input = torch.cat((in_data, get_jac_param(mem), get_jac_param(action)), dim=1)
+        new_pred_env = pred_env_model(models_input)
+        new_mem = pred_mem_model(models_input)
+        new_action = actor_model(models_input)
+
+        return torch.cat(torch.cat((new_mem,new_action,new_pred_env),dim=1))
+
+    all_model_params = itertools.chain(pred_mem_model.parameters(),
+                                       actor_model.parameters(),
+                                       pred_env_model.parameters())
+    snake = Snake(snake_loop_fn, all_model_params, , [action])
 
     def actor_snake_loop_fn(in_data):
         res = actor_snake_model(
