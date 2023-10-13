@@ -172,75 +172,70 @@ class JacLinear(nn.Module):
 
 def test_snake(n_env, n_action, n_mem, n_batches, n_iters, n_test_iters, lr, start_env_fn, env_fn, calc_agent_loss_fn):
 
-    # this stores memory and the last action taken. It requires grad so it can be used in a snake
-    # as the loop param
-    mem = torch.zeros(n_batches, n_mem, requires_grad=True)
-    action = torch.zeros(n_batches, n_action, requires_grad=True)
-    env = torch.zeros(n_batches, n_env, requires_grad=True)
-    mem_action_env = torch.cat((mem, action, env), dim=1)
+    n_loop_values = n_mem+n_action+n_env
+
+    mem_action_env = torch.zeros(n_batches, n_loop_values, requires_grad=True)
 
     # this corresponds to the memory the predictor can create to help it predict
-    pred_mem_model = JacLinear(n_env+n_mem+n_action, n_mem)
+    pred_mem_model = JacLinear(n_loop_values, n_mem)
+
+    # this corresponds to the actions the actor can take
+    actor_model = JacLinear(n_loop_values, n_action)
 
     # the prediction model tries to predict what the environment will be given the current
     # memory, action and environment
-    pred_env_model = torch.nn.Linear(n_env+n_mem+n_action, n_env)
-
-    # this corresponds to the actions the actor can take
-    actor_model = JacLinear(n_env+n_mem+n_action, n_action)
+    pred_env_model = JacLinear(n_loop_values, n_env)
 
     def snake_loop_fn(in_data):
-        models_input = torch.cat((in_data, get_jac_param(mem), get_jac_param(action)), dim=1)
+        models_input = get_jac_param(mem_action_env)
         new_pred_env = pred_env_model(models_input)
         new_mem = pred_mem_model(models_input)
         new_action = actor_model(models_input)
 
-        return torch.cat(torch.cat((new_mem,new_action,new_pred_env),dim=1))
+        return torch.cat((new_mem,new_action,new_pred_env),dim=1)
 
     all_model_params = itertools.chain(pred_mem_model.parameters(),
                                        actor_model.parameters(),
                                        pred_env_model.parameters())
-    snake = Snake(snake_loop_fn, all_model_params, , [action])
+    snake = Snake(snake_loop_fn, all_model_params, mem_action_env, [])
 
-    def actor_snake_loop_fn(in_data):
-        res = actor_snake_model(
-            torch.cat((in_data, get_jac_param(mem), get_jac_param(action)), dim=1))
-        return res
-
-    # the actor snake loops over action, and decides what the agent should do, based on how the predictor is
-    # predicting pleasure/pain
-    actor_snake = Snake(actor_snake_loop_fn, list(
-        actor_snake_model.parameters()), action, [mem])
-
-    pred_optim = torch.optim.SGD(pred_win_model.parameters(), lr=lr)
-    pred_snake_optim = torch.optim.SGD(pred_snake_model.parameters(), lr=lr)
-    actor_snake_optim = torch.optim.SGD(actor_snake_model.parameters(), lr=lr)
+    pred_env_optim = torch.optim.SGD(pred_env_model.parameters(), lr=lr)
+    pred_mem_optim = torch.optim.SGD(pred_mem_model.parameters(), lr=lr)
+    actor_optim = torch.optim.SGD(actor_model.parameters(), lr=lr)
 
     hidden_env,env = start_env_fn(n_batches,0)
+
+    action_start = n_mem
+    action_end = action_start + n_action
+    env_start = action_end
+    env_end = action_end + n_env
 
     #training
     for i in range(n_iters):
         with torch.no_grad():
-            hidden_env,env = env_fn(n_batches, hidden_env, env, action, i)
+            next_hidden_env,next_env = env_fn(n_batches, hidden_env, env, mem_action_env[action_start:action_end], i)
 
-            pred_optim.zero_grad()
-            if mem.grad is not None:
-                mem.grad.zero_()
-                # mem and action is not in the pred_optim, since we don't update the values based
+            pred_env_optim.zero_grad()
+            pred_mem_optim.zero_grad()
+            actor_optim.zero_grad()
+
+            if mem_action_env.grad is not None:
+                # mem_action_env is not in any optim, since we don't update the values based
                 # on the gradiant, but only use them for the snake, so we have to zero them manually
                 # here
-                action.grad.zero_()
+                mem_action_env.grad.zero_()
 
         #how good or bad the agent is doing in its environment
         agent_loss = calc_agent_loss_fn(env)
 
-        pred_loss = (pred_win_model(mem_action) -
-                     agent_loss).sum()
+        pred_env_loss = (pred_env_model(mem_action_env) -
+                         next_env).abs().sum()
 
         # note that even though pred_optim only has pred_win_model parameters, this backward call
         # will also update the grad for mem_action
         pred_loss.backward()
         pred_optim.step()
+        next_pred_env = pred_snake.run(env)
 
         # this will set the gradiants for the pred_snake_model
         next_mem = pred_snake.run(env)
