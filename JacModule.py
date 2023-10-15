@@ -85,15 +85,15 @@ class Snake(object):
         self.jac_params = [self.loop_param] + self.model_params
         self.running_jac_grads = [torch.zeros(*loop_param.shape, *jp.shape) for jp in self.model_params]
 
-    def _calc_grad_from_running_jac_grad(self, running_jac_grad, jp):
+    def _calc_grad_from_running_jac_grad(self, running_jac_grad, jp, next_loop_param):
         """
         Figures out the grad for the given jacparameter.
         """
         # number of dimensions in the memory output
-        n_loop_dims = self.loop_param.dim()
+        n_loop_dims = next_loop_param.dim()
         n_dims = running_jac_grad.dim()
-        dimmed_loss_grad = self.loop_param.grad.view(
-            list(self.loop_param.grad.shape) + [1] * (n_dims - n_loop_dims))
+        dimmed_loss_grad = next_loop_param.grad.view(
+            list(next_loop_param.grad.shape) + [1] * (n_dims - n_loop_dims))
 
         res = dimmed_loss_grad * running_jac_grad
 
@@ -126,21 +126,33 @@ class Snake(object):
         return res * \
             (1. - self.decay) + jp_jac_grad * self.decay
 
-    def run(self, in_data):
+    def run_jacobian(self, in_data):
         """
-        Expects loss to be calculated relative to the parameters in init()
-        Will update the grad by the running jac grad for each parameter in the snake.
-        Also updates the running jac grad for each parameter. Should be called each cycle
+        runs the snake, returning the output and the gradiants. update_param_grads should be called next, after total
+        loss is calculated and backward() is called.
         """
         grads, data_out = jac_grad(self.loop_fn, in_data, [
                                    self.loop_param], self.model_params, self.other_batch_indexed_params, **self.jac_grad_kw)
 
+        data_out = data_out.detach()
+        data_out.requires_grad = True
+
+        return grads,data_out
+
+        
+    def update_param_grads(self, grads, next_loop_param):
+        """
+        Expects loss to be calculated relative to the parameters in init()
+        Will update the grad by the running jac grad for each parameter in the snake.
+        Also updates the running jac grad for each parameter. Should be called after
+        run_jacobian
+        """
         loop_param_jac_grad = grads[0]
 
         for index, jp_jac_grad in enumerate(grads[1:]):
             jp = self.model_params[index]
             jp_running_jac_grad = self.running_jac_grads[index]
-            running_portion_grad = self._calc_grad_from_running_jac_grad(jp_running_jac_grad, jp)
+            running_portion_grad = self._calc_grad_from_running_jac_grad(jp_running_jac_grad, jp,next_loop_param)
             if jp.grad is None:
                 jp.grad = running_portion_grad
             else:
@@ -148,8 +160,6 @@ class Snake(object):
 
             self.running_jac_grads[index] = self._calc_running_jac_grad(
                 loop_param_jac_grad, jp_running_jac_grad, jp_jac_grad)
-
-        return data_out
 
 
 class JacLinear(nn.Module):
@@ -169,97 +179,110 @@ class JacLinear(nn.Module):
     def forward(self, inp):
         return nn.functional.linear(inp, get_jac_param(self.weight), get_jac_param(self.bias) if self.bias is not None else None)
 
+class LilOleModel(torch.nn.Module):
+    def __init__(self, n_in, n_out,scale=1.):
+        super().__init__()
+        self.scale = scale
+        self.m = torch.nn.Sequential(JacLinear(n_in, n_out),
+                                     torch.nn.Tanh())
+
+    def forward(self,in_data):
+        return self.m(in_data) * self.scale
 
 def test_snake(n_env, n_action, n_mem, n_batches, n_iters, n_test_iters, lr, start_env_fn, env_fn, calc_agent_loss_fn):
 
     n_loop_values = n_mem+n_action+n_env
 
-    mem_action_env = torch.zeros(n_batches, n_loop_values, requires_grad=True)
+    #the loop parameter is the memory, action, and predicted environment
+    mem_action_penv = torch.randn(n_batches, n_loop_values) * .1
+    mem_action_penv.requires_grad = True
 
     # this corresponds to the memory the predictor can create to help it predict
-    pred_mem_model = JacLinear(n_loop_values, n_mem)
+    pred_mem_model = LilOleModel(n_loop_values, n_mem)
 
     # this corresponds to the actions the actor can take
-    actor_model = JacLinear(n_loop_values, n_action)
+    actor_model = LilOleModel(n_loop_values, n_action,0.1) 
 
     # the prediction model tries to predict what the environment will be given the current
     # memory, action and environment
     pred_env_model = JacLinear(n_loop_values, n_env)
 
     def snake_loop_fn(in_data):
-        models_input = get_jac_param(mem_action_env)
+        #we use the predicted environment from the last round as input to
+        #get the next round values
+        #
+        #TODO 4 I'm not sure whether the actual environment or the predicted
+        #environment is better here. The problem with the actual environment, is
+        #that it doesn't actually loop, so it becomes tricky as to when and how
+        #to insert the actual environment into the snake.
+        models_input = get_jac_param(mem_action_penv)
         new_pred_env = pred_env_model(models_input)
         new_mem = pred_mem_model(models_input)
         new_action = actor_model(models_input)
 
         return torch.cat((new_mem,new_action,new_pred_env),dim=1)
 
-    all_model_params = itertools.chain(pred_mem_model.parameters(),
-                                       actor_model.parameters(),
-                                       pred_env_model.parameters())
-    snake = Snake(snake_loop_fn, all_model_params, mem_action_env, [])
+    all_model_params = list(itertools.chain(pred_mem_model.parameters(),
+                                            actor_model.parameters(),
+                                            pred_env_model.parameters()))
 
-    pred_env_optim = torch.optim.SGD(pred_env_model.parameters(), lr=lr)
-    pred_mem_optim = torch.optim.SGD(pred_mem_model.parameters(), lr=lr)
-    actor_optim = torch.optim.SGD(actor_model.parameters(), lr=lr)
+    snake = Snake(snake_loop_fn, all_model_params, mem_action_penv, [])
 
-    hidden_env,env = start_env_fn(n_batches,0)
+    optim = torch.optim.SGD(all_model_params, lr=lr)
 
     action_start = n_mem
     action_end = action_start + n_action
     env_start = action_end
     env_end = action_end + n_env
 
+    hidden_env,env = start_env_fn(n_batches,0)
+
+    #setup the initial environment for each item in batch
+    with torch.no_grad():
+        mem_action_penv[:,env_start:env_end].copy_(env)
+
     #training
     for i in range(n_iters):
         with torch.no_grad():
-            next_hidden_env,next_env = env_fn(n_batches, hidden_env, env, mem_action_env[action_start:action_end], i)
+            optim.zero_grad()
 
-            pred_env_optim.zero_grad()
-            pred_mem_optim.zero_grad()
-            actor_optim.zero_grad()
-
-            if mem_action_env.grad is not None:
+            if mem_action_penv.grad is not None:
                 # mem_action_env is not in any optim, since we don't update the values based
                 # on the gradiant, but only use them for the snake, so we have to zero them manually
                 # here
-                mem_action_env.grad.zero_()
+                mem_action_penv.grad.zero_()
 
-        #how good or bad the agent is doing in its environment
-        agent_loss = calc_agent_loss_fn(env)
+        #the agent reacts to the current environment (env) with a new memory, action, and
+        #predicted environment
+        grads,next_mem_action_penv = snake.run_jacobian(env)
 
-        pred_env_loss = (pred_env_model(mem_action_env) -
-                         next_env).abs().sum()
+        next_action = next_mem_action_penv[:,action_start:action_end]
+        next_penv = next_mem_action_penv[:,env_start:env_end]
 
-        # note that even though pred_optim only has pred_win_model parameters, this backward call
-        # will also update the grad for mem_action
-        pred_loss.backward()
-        pred_optim.step()
-        next_pred_env = pred_snake.run(env)
+        #calculate the next environment so we can compute loss
+        next_hidden_env,next_env,agent_loss = env_fn(n_batches, hidden_env, env, next_action, i)
 
-        # this will set the gradiants for the pred_snake_model
-        next_mem = pred_snake.run(env)
-        pred_snake_optim.step()
+        #the environment predictor's loss is how off it is from the actual environment
+        #TODO 4 I think that maybe we need to somehow prioritize the values of some elements
+        #in the environment over others based on action memory. Have to think about how this
+        #could be set up.
+        pred_env_loss = (next_penv-next_env).abs().sum()
 
-        with torch.no_grad():
-            # we need to zero out mem_action again, because now we calculate the gradiant
-            # vs a winning environment (ie 1). Basically higher is better
-            mem.grad.zero_()
-            action.grad.zero_()
+        #there is no memory loss. the memory part of the model gets updated as part of the snake updating
+        #the previous cycles
 
-        #PERF we're recalculating pred_win_model(mem_action) a second time to reset the derivatives,
-        #     we could also keep the result and use retain_graph=True. Don't know if it's worth it
-        #     as a performance/memory tradeoff 
-        actor_loss = (1. - pred_win_model(mem_action)).sum(0)
-        actor_loss.backward()
+        #TODO 3 maybe balance these?
+        total_loss = (pred_env_loss + agent_loss[:,0]).sum(dim=0)
 
-        next_action = actor_snake.run(env)
-        actor_snake_optim.step()
+        total_loss.backward()
 
         with torch.no_grad():
-            mem.copy_(next_mem)
-            action.copy_(next_action)
-
+            snake.update_param_grads(grads,next_mem_action_penv)
+            if(i%100 == 0):
+                print(f'{i=}\n,{hidden_env=}\n{next_env=}\n{next_penv=}\n{next_action=}')
+            optim.step()
+            mem_action_penv.copy_(next_mem_action_penv)
+            env = next_env
     # env = start_env
 
     # #testing
@@ -267,17 +290,14 @@ def test_snake(n_env, n_action, n_mem, n_batches, n_iters, n_test_iters, lr, sta
     #     in_data = env_fn(n_batches, env, action, i)
 
 
-
-
-
 def test1():
 
-    def calc_agent_loss_fn(hidden_env):
-        env_pos = hidden_env[:,0]
+    def calc_agent_loss_fn(action,hidden_env,env):
+        env_pos = hidden_env[:,0].unsqueeze(1)
         #env_speed = hidden_env[1]
 
         #if the environment position is within 1 of 42, there is no loss, otherwise there is an ever increasing loss
-        agent_loss = (env_pos - 42.).abs().max(torch.tensor(1.))
+        agent_loss = (env_pos - 42. + action).abs().max(torch.tensor(1.))
         agent_loss = agent_loss * (agent_loss != 1.)
 
         return agent_loss
@@ -285,7 +305,7 @@ def test1():
     def start_env_fn(n_batches,seed):
         torch.manual_seed(seed)
         hidden_env = torch.rand((n_batches,2)) * torch.tensor([[10.,0.1]]) + torch.tensor([[42.,-0.05]])
-        return hidden_env,calc_agent_loss_fn(hidden_env)
+        return hidden_env,calc_agent_loss_fn(torch.zeros((n_batches,1)),hidden_env,None)
     
     #simulate a blind cave. The agent doesn't know where it is or its speed
     def env_fn(batches, hidden_env, env, action, index):
@@ -293,22 +313,24 @@ def test1():
         Very simple accelerator, speed and position
         """
         #just an up/down accelerator
-        action_accelerator = action[0]
+        action_accelerator = action[:,0]
 
-        env_pos = hidden_env[0]
-        env_speed = hidden_env[1]
+        env_pos = hidden_env[:,0]
+        env_speed = hidden_env[:,1]
         
         env_pos += env_speed
         env_speed += action_accelerator
 
-        hidden_env[0] = env_pos
-        hidden_env[1] = env_speed
+        #we detach here so that the backward() grad_fn chain doesn't extend into what was already
+        #done by the snake, sss
+        hidden_env = torch.stack((env_pos,env_speed),dim=1).detach()
+        hidden_env.requires_grad = True
 
-        env = calc_agent_loss_fn(hidden_env).unsqueeze(dim=0)
+        env = calc_agent_loss_fn(action,hidden_env,env)
 
-        return hidden_env,env
+        return hidden_env,env,env
 
-    test_snake(n_env=2, n_action=1, n_mem=3, n_batches=4, n_iters=1000, n_test_iters=100, lr=1e-4,
+    test_snake(n_env=1, n_action=1, n_mem=3, n_batches=4, n_iters=100000, n_test_iters=100, lr=1e-4,
                start_env_fn=start_env_fn,env_fn=env_fn, calc_agent_loss_fn=calc_agent_loss_fn)
 
 if __name__ == '__main__':
