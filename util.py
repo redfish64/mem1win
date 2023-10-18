@@ -323,7 +323,7 @@ def mult_list(l):
     return t
     
 
-def cross_product_batch_ldim_tensors(a,a_split_point,b,b_split_point):
+def matmul_batch_ldim_tensors(a,a_split_point,b,b_split_point):
     """
     Runs a mat mul against tensors with more than 2 dimensions by defining a split
     point and then viewing them as two dimensional with a single batch dimension in front.
