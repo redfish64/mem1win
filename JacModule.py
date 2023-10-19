@@ -1,5 +1,3 @@
-# modules that can work with jacrev. The only difference is that it's parameters are passed into it during the forward call.
-
 import torch
 import torch.nn as nn
 import torch.func as f
@@ -74,7 +72,7 @@ class Snake(object):
 
     """
 
-    def __init__(self, loop_fn, model_params, loop_param, other_batch_indexed_params, is_mem_params, mem_params_max_grad=1., mem_params_epsilon=1e-6,decay=0.05, **jac_grad_kw):
+    def __init__(self, loop_fn, model_params, loop_param, other_batch_indexed_params, is_mem_out, mem_params_max_grad=1., mem_params_epsilon=1e-6,decay=0.05, **jac_grad_kw):
         super(Snake, self).__init__()
         self.loop_fn = loop_fn
         self.model_params = model_params
@@ -86,17 +84,37 @@ class Snake(object):
         self.running_jac_grads = [torch.zeros(*loop_param.shape, *jp.shape) for jp in self.model_params]
         self.mem_params_max_grad = mem_params_max_grad
         self.mem_params_epsilon = mem_params_epsilon
-        self.is_mem_params = is_mem_params
+        self.is_mem_out = is_mem_out
 
-    def _calc_grad_from_running_jac_grad(self, running_jac_grad, jp, next_loop_param):
+    def _calc_grad_from_running_jac_grad(self, running_jac_grad, jp, next_loop_param_grad):
         """
         Figures out the grad for the given jacparameter.
         """
         # number of dimensions in the memory output
-        n_loop_dims = next_loop_param.dim()
+        n_loop_dims = next_loop_param_grad.dim()
         n_dims = running_jac_grad.dim()
-        dimmed_loss_grad = next_loop_param.grad.view(
-            list(next_loop_param.grad.shape) + [1] * (n_dims - n_loop_dims))
+        dimmed_loss_grad = next_loop_param_grad.view(
+            list(next_loop_param_grad.shape) + [1] * (n_dims - n_loop_dims))
+
+        # # we want an inverse gradiant for memory. The idea is that we want a high change to to memory when
+        # # nothing depends on it and a low change when things *do* pay attention
+        # # if we don't do this, then what tends to happen is memory doesn't change because nothing is paying
+        # # attention to it, and nothing pays attention to it because it doesn't change
+
+        # with torch.no_grad():
+        #     # get the avg of all non memory related values. That is gradiants that aren't from or to a
+        #     # value representing a memory unit.
+        #     non_mem_avg = (loop_param_jac_grad * (~self.is_mem_out) * (~self.is_mem_out.unsqueeze(1))).abs().mean()
+
+        #     #we use the following equation, and then flip x and y basically:
+        #     # (x + epsilon) * y = avg
+        #     # y = avg / (x + epsilon)
+        #     # but we want in both negative and positive spaces
+            
+        # # modded_next_loop_param =
+        # #     (self.mem_params_epsilon * self.mem_params_max_grad / (self.mem_params_epsilon + next_loop_param).abs()
+        # #      * ((next_loop_param >= 0.) * 2. - 1.)) * self.is_mem_out +
+        # #     next_loop_param * (1. - self.is_mem_out)
 
         res = dimmed_loss_grad * running_jac_grad
 
@@ -143,7 +161,7 @@ class Snake(object):
         return grads,data_out
 
         
-    def update_param_grads(self, grads, next_loop_param):
+    def update_param_grads(self, grads, next_loop_param_grad):
         """
         Expects loss to be calculated relative to the parameters in init()
         Will update the grad by the running jac grad for each parameter in the snake.
@@ -154,7 +172,6 @@ class Snake(object):
 
         for index, jp_jac_grad in enumerate(grads[1:]):
             jp = self.model_params[index]
-            is_mem = self.is_mem_params[index]
             jp_running_jac_grad = self.running_jac_grads[index]
 
             #update the running_jac_grad to the end of the current cycle
@@ -163,16 +180,7 @@ class Snake(object):
 
             #link the running_jac_grad which extends to the end of the current cycle to the next_loop_param.grad
             #which goes from the end of the current cycle to the result
-            running_portion_grad = self._calc_grad_from_running_jac_grad(jp_running_jac_grad, jp,next_loop_param)
-            if(is_mem):
-                # (e) * m / (e + x) for x >= 0
-                # (e) * m / (-e + x) for x < 0
-                # this is a inverse gradiant for memory. The idea is that we want a high change to to memory when
-                # nothing depends on it and a low change when things *do* pay attention
-                # if we don't do this, then what tends to happen is memory doesn't change because nothing is paying
-                # attention to it, and nothing pays attention to it because it doesn't change
-                running_portion_grad = (self.mem_params_epsilon * self.mem_params_max_grad / (self.mem_params_epsilon + running_portion_grad).abs()
-                                        * ((running_portion_grad >= 0.) * 2. - 1.))
+            running_portion_grad = self._calc_grad_from_running_jac_grad(jp_running_jac_grad, jp,next_loop_param_grad)
             if jp.grad is None:
                 jp.grad = running_portion_grad
             else:
@@ -260,10 +268,7 @@ def test_snake(n_env, n_action, n_mem, n_batches, n_iters, n_test_iters, lr, pre
     l_pred_env_params = list(pred_env_model.parameters())
     all_model_params = l_pred_mem_model_params + l_actor_model_params + l_pred_env_params
 
-    #super hack, we manually figure out which parameters are associated with memory and should have their grads reversed
-    is_mem_params = [True] * len(l_pred_mem_model_params) + [False] * (len(l_actor_model_params) + len(l_pred_mem_model_params))
-
-    snake = Snake(snake_loop_fn, all_model_params, mem_action_penv,[],is_mem_params,decay=decay)
+    snake = Snake(snake_loop_fn, all_model_params, mem_action_penv,[],torch.tensor([True] * n_mem + [False] * (n_action+n_env)),decay=decay)
 
     optim = torch.optim.SGD(all_model_params, lr=lr)
 
@@ -319,10 +324,10 @@ def test_snake(n_env, n_action, n_mem, n_batches, n_iters, n_test_iters, lr, pre
         total_loss.backward()
 
         with torch.no_grad():
-            snake.update_param_grads(grads,next_mem_action_penv)
+            snake.update_param_grads(grads,next_mem_action_penv.grad)
             if(i%199 == 0):
                 print(f'{i=}\n{next_mem=}\n{next_hidden_env=}\n{next_env=}\n{next_penv=}\n{next_action=}')
-                if(i > 10000000):
+                if(i > 1000):
                     pdb.set_trace()
             optim.step()
             mem_action_penv.copy_(next_mem_action_penv)
