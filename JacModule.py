@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as nf
 import torch.func as f
 from dataclasses import dataclass
 import pdb
@@ -152,8 +153,9 @@ class Snake(object):
         runs the snake, returning the output and the gradiants. update_param_grads should be called next, after total
         loss is calculated and backward() is called.
         """
-        grads, data_out = jac_grad(self.loop_fn, in_data, [
-                                   self.loop_param], self.model_params, self.other_batch_indexed_params, **self.jac_grad_kw)
+        grads, data_out = jac_grad(self.loop_fn, in_data,
+                                   [self.loop_param], self.model_params, self.other_batch_indexed_params,
+                                   **self.jac_grad_kw)
 
         data_out = data_out.detach()
         data_out.requires_grad = True
@@ -196,7 +198,7 @@ class JacLinear(nn.Module):
         self.n_out = n_out
 
         self.weight = torch.nn.Parameter(
-            torch.randn((n_out, n_in)) * 0.01, requires_grad)
+            torch.randn((n_out, n_in)) * 0.1, requires_grad)
         self.bias = torch.nn.Parameter(torch.zeros(
             (n_out,)), requires_grad) if has_bias else None
 
@@ -216,6 +218,17 @@ class PassThru(torch.nn.Module):
     def forward(self,in_data):
         res = self.m(in_data)
         res = res + in_data[:,self.start:self.end]
+
+        return res
+
+class ZeroToOne(torch.nn.Module):
+    def __init__(self, m):
+        super().__init__()
+        self.m = m
+
+    def forward(self,in_data):
+        res = self.m(in_data)
+        res = nf.tanh(res) * 0.5 + 0.5
 
         return res
 
@@ -245,18 +258,12 @@ def test_snake(n_env, n_action, n_mem, n_batches, n_iters, n_test_iters, lr, pre
     n_loop_values = n_mem+n_action+n_env
 
     #the loop parameter is the memory, action, and predicted environment
-    mem_action_penv = torch.randn(n_batches, n_loop_values) * .1
-    mem_action_penv.requires_grad = True
+    mem_action_env = torch.randn(n_batches, n_loop_values) * .1
+    mem_action_env.requires_grad = True
 
     def snake_loop_fn(in_data):
-        #we use the predicted environment from the last round as input to
-        #get the next round values
-        #
-        #TODO 4 I'm not sure whether the actual environment or the predicted
-        #environment is better here. The problem with the actual environment, is
-        #that it doesn't actually loop, so it becomes tricky as to when and how
-        #to insert the actual environment into the snake.
-        models_input = get_jac_param(mem_action_penv)
+        #mem_action_env already contains in_data (which is the environment), so we ignore it here
+        models_input = get_jac_param(mem_action_env)
         new_pred_env = pred_env_model(models_input)
         new_mem = pred_mem_model(models_input)
         new_action = actor_model(models_input)
@@ -268,10 +275,12 @@ def test_snake(n_env, n_action, n_mem, n_batches, n_iters, n_test_iters, lr, pre
     l_pred_env_params = list(pred_env_model.parameters())
     all_model_params = l_pred_mem_model_params + l_actor_model_params + l_pred_env_params
 
-    snake = Snake(snake_loop_fn, all_model_params, mem_action_penv,[],torch.tensor([True] * n_mem + [False] * (n_action+n_env)),decay=decay)
+    snake = Snake(snake_loop_fn, all_model_params, mem_action_env,[],torch.tensor([True] * n_mem + [False] * (n_action+n_env)),decay=decay)
 
     optim = torch.optim.SGD(all_model_params, lr=lr)
 
+    mem_start = 0
+    mem_end = n_mem
     action_start = n_mem
     action_end = action_start + n_action
     env_start = action_end
@@ -281,18 +290,18 @@ def test_snake(n_env, n_action, n_mem, n_batches, n_iters, n_test_iters, lr, pre
 
     #setup the initial environment for each item in batch
     with torch.no_grad():
-        mem_action_penv[:,env_start:env_end].copy_(env)
+        mem_action_env[:,env_start:env_end].copy_(env)
 
     #training
     for i in range(n_iters):
         with torch.no_grad():
             optim.zero_grad()
 
-            if mem_action_penv.grad is not None:
+            if mem_action_env.grad is not None:
                 # mem_action_env is not in any optim, since we don't update the values based
                 # on the gradiant, but only use them for the snake, so we have to zero them manually
                 # here
-                mem_action_penv.grad.zero_()
+                mem_action_env.grad.zero_()
 
         #the agent reacts to the current environment (env) with a new memory, action, and
         #predicted environment
@@ -326,11 +335,17 @@ def test_snake(n_env, n_action, n_mem, n_batches, n_iters, n_test_iters, lr, pre
         with torch.no_grad():
             snake.update_param_grads(grads,next_mem_action_penv.grad)
             if(i%199 == 0):
-                print(f'{i=}\n{next_mem=}\n{next_hidden_env=}\n{next_env=}\n{next_penv=}\n{next_action=}')
-                if(i > 1000):
+                print(f'{i=}\n{next_mem=}\n{next_env=}\n{next_penv=}\n{next_action=}')
+                if(i > 10000000):
                     pdb.set_trace()
             optim.step()
-            mem_action_penv.copy_(next_mem_action_penv)
+            mem_action_env.copy_(next_mem_action_penv)
+
+            mem_action_env[:,env_start:env_end].copy_(env)
+
+            #H*CK to see what happens if we add env to mem
+            #mem_action_env[:,mem_start:mem_end] = (mem_action_env[:,mem_start:mem_end] + mem_action_env[:,env_start:env_end]).detach()
+
             env = next_env
             hidden_env = next_hidden_env
     # env = start_env
@@ -392,15 +407,15 @@ def test3():
         return torch.arange(end=n_batches),torch.zeros((n_batches,1))
     
     def env_fn(batches, hidden_env, env, action, index):
-        env = ((torch.remainder(hidden_env,2) == 0)) * 1.
-        #env = ((torch.remainder(hidden_env,3) == 0) + torch.remainder(hidden_env,5) == 0) * 1.
-        #env = torch.ones_like(env) #HACK!!!
+        #env = ((torch.remainder(hidden_env,2) == 0)) * 1.
+        env = ((torch.remainder(hidden_env,3) == 0) + (torch.remainder(hidden_env,5) == 0)) * 1.
+        #env = torch.ones_like(env) #H*CK!!!
         hidden_env += 1
         return hidden_env,env
 
     n_env = 1
     n_action = 1
-    n_mem = 1
+    n_mem = 5
     n_loop_values = n_env+n_action+n_mem
     
 
@@ -410,11 +425,16 @@ def test3():
     pred_mem_model = JacLinear(n_loop_values, n_mem)
 
     # this corresponds to the actions the actor can take
-    actor_model = JacLinear(n_loop_values, n_action) 
+    actor_model = ZeroToOne(JacLinear(n_loop_values, n_action))
 
     # the prediction model tries to predict what the environment will be given the current
     # memory, action and environment
-    pred_env_model = JacLinear(n_loop_values, n_env)
+    pred_env_model = ZeroToOne(JacLinear(n_loop_values, n_env))
+
+    #H*CK to see what happens if we make the actor and environment model initially very interested in the memory
+    # with torch.no_grad():
+    #     actor_model.weight[0:n_mem] += 1.
+    #     pred_env_model.weight[0:n_mem] += 1.
 
     test_snake(n_env=n_env, n_action=n_action, n_mem=n_mem, n_batches=1, n_iters=100000, n_test_iters=100, lr=1e-2,
                pred_mem_model=pred_mem_model,actor_model=actor_model,pred_env_model=pred_env_model,
@@ -461,7 +481,7 @@ def testx():
 
         return hidden_env,env,env
 
-    test_snake(n_env=1, n_action=1, n_mem=3, n_batches=1, n_iters=100000, n_test_iters=100, lr=1e-4,
+    test_snake(n_env=1, n_action=1, n_mem=3, n_batches=1, n_iters=100000, n_test_iters=100, lr=3e-3,
                start_env_fn=start_env_fn,env_fn=env_fn, calc_agent_loss_fn=calc_agent_loss_fn,decay=0.3)
 
 if __name__ == '__main__':
