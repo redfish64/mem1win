@@ -73,7 +73,7 @@ class Snake(object):
 
     """
 
-    def __init__(self, loop_fn, model_params, loop_param, other_batch_indexed_params, is_mem_out, mem_params_max_grad=1., mem_params_epsilon=1e-6,decay=0.05, **jac_grad_kw):
+    def __init__(self, loop_fn, model_params, loop_param, other_batch_indexed_params, mem_params_max_grad=1., mem_params_epsilon=1e-6,decay=0.05, **jac_grad_kw):
         super(Snake, self).__init__()
         self.loop_fn = loop_fn
         self.model_params = model_params
@@ -85,7 +85,6 @@ class Snake(object):
         self.running_jac_grads = [torch.zeros(*loop_param.shape, *jp.shape) for jp in self.model_params]
         self.mem_params_max_grad = mem_params_max_grad
         self.mem_params_epsilon = mem_params_epsilon
-        self.is_mem_out = is_mem_out
 
     def _calc_grad_from_running_jac_grad(self, running_jac_grad, jp, next_loop_param_grad):
         """
@@ -96,26 +95,6 @@ class Snake(object):
         n_dims = running_jac_grad.dim()
         dimmed_loss_grad = next_loop_param_grad.view(
             list(next_loop_param_grad.shape) + [1] * (n_dims - n_loop_dims))
-
-        # # we want an inverse gradiant for memory. The idea is that we want a high change to to memory when
-        # # nothing depends on it and a low change when things *do* pay attention
-        # # if we don't do this, then what tends to happen is memory doesn't change because nothing is paying
-        # # attention to it, and nothing pays attention to it because it doesn't change
-
-        # with torch.no_grad():
-        #     # get the avg of all non memory related values. That is gradiants that aren't from or to a
-        #     # value representing a memory unit.
-        #     non_mem_avg = (loop_param_jac_grad * (~self.is_mem_out) * (~self.is_mem_out.unsqueeze(1))).abs().mean()
-
-        #     #we use the following equation, and then flip x and y basically:
-        #     # (x + epsilon) * y = avg
-        #     # y = avg / (x + epsilon)
-        #     # but we want in both negative and positive spaces
-            
-        # # modded_next_loop_param =
-        # #     (self.mem_params_epsilon * self.mem_params_max_grad / (self.mem_params_epsilon + next_loop_param).abs()
-        # #      * ((next_loop_param >= 0.) * 2. - 1.)) * self.is_mem_out +
-        # #     next_loop_param * (1. - self.is_mem_out)
 
         res = dimmed_loss_grad * running_jac_grad
 
@@ -275,7 +254,7 @@ def test_snake(n_env, n_action, n_mem, n_batches, n_iters, n_test_iters, lr, pre
     l_pred_env_params = list(pred_env_model.parameters())
     all_model_params = l_pred_mem_model_params + l_actor_model_params + l_pred_env_params
 
-    snake = Snake(snake_loop_fn, all_model_params, mem_action_env,[],torch.tensor([True] * n_mem + [False] * (n_action+n_env)),decay=decay)
+    snake = Snake(snake_loop_fn, all_model_params, mem_action_env,[],decay=decay)
 
     optim = torch.optim.SGD(all_model_params, lr=lr)
 
