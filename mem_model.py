@@ -55,7 +55,12 @@ class CausalSelfAttention(nn.Module):
 
         total_size = config.block_size + config.n_memory_per_layer
         if not self.flash:
-            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
+            if(config.no_flash):
+                print("Flash attention turned off")
+
+            else:
+                print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
+                
             # causal mask to ensure that attention is only applied to the left in the input sequence
             self.register_buffer("no_flash_attn_mask",
                                  torch.tril(torch.ones(config.block_size,total_size),diagonal=config.n_memory_per_layer)
@@ -190,9 +195,10 @@ class Block(nn.Module):
                                       
 
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.mem_ln_1 = LayerNorm(config.n_mem_embd, bias=config.bias)
         self.attn = CausalSelfAttention(self.memory,config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        #TODO 3 do we really want layernorm for mem?
+        self.mem_ln_1 = LayerNorm(config.n_mem_embd, bias=config.bias)
         self.mem_ln_2 = LayerNorm(config.n_mem_embd, bias=config.bias)
         self.mlp = MLP(config,config.n_embd,True)
         self.mem_mlp = MLP(config,config.n_mem_embd,False)
@@ -201,6 +207,9 @@ class Block(nn.Module):
         self.n_memory_per_layer = config.n_memory_per_layer
         self.n_mem_embd = config.n_mem_embd
         self.mem_grad_multiplier = torch.tensor(config.mem_grad_multiplier)
+
+        all_mem_params = l_pred_mem_model_params + l_actor_model_params + l_pred_env_params
+        self.snake = jm.Snake(loop_fn, 
 
     def forward(self, x):
         x = x + self.attn(self.mem_ln_1(jm.get_jac_param(self.memory)),self.ln_1(x))
@@ -214,6 +223,8 @@ class Block(nn.Module):
 
     def get_mem_params(self):
         return (self.attn.get_mem_params() +
+                self.mem_ln_1.get_jac_params())
+                self.mem_ln_2.get_jac_params())
                 self.mem_mlp.get_jac_params())
         
     def get_out_params(self):

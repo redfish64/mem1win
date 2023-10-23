@@ -12,6 +12,7 @@ import os
 import pdb
 import matplotlib.pyplot as plt
 import mem_model as model
+import JacModule as jm
 
 # the reason I copied util into this git tree is so that there is a consistent commit. When we run each
 # session, I want to record the git state along with all parameters, so that I can reproduce/track the results
@@ -451,6 +452,7 @@ def create_model_state(enc,parser,config):
         test_wl = None
 
     return ModelState(m,wl,test_wl,optimizer,config)
+
 
 def choose_new_filename(filename):
     if(filename is None):

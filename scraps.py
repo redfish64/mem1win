@@ -229,3 +229,6 @@ def test1():
         return (env.sum(dim=1) * ca.sum(dim=1)).unsqueeze(0).T
 
     test_snake(2, data_fn, calc_pain_pleasure_fn)
+def create_snake_sss(ms):
+    snake = Snake(snake_loop_fn, 
+
