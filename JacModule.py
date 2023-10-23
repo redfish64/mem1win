@@ -73,7 +73,7 @@ class Snake(object):
 
     """
 
-    def __init__(self, loop_fn, model_params, loop_param, other_batch_indexed_params, mem_params_max_grad=1., mem_params_epsilon=1e-6,decay=0.05, **jac_grad_kw):
+    def __init__(self, loop_fn, model_params, loop_param, other_batch_indexed_params,decay=0.05, **jac_grad_kw):
         super(Snake, self).__init__()
         self.loop_fn = loop_fn
         self.model_params = model_params
@@ -83,8 +83,6 @@ class Snake(object):
         self.jac_grad_kw = jac_grad_kw
         self.jac_params = [self.loop_param] + self.model_params
         self.running_jac_grads = [torch.zeros(*loop_param.shape, *jp.shape) for jp in self.model_params]
-        self.mem_params_max_grad = mem_params_max_grad
-        self.mem_params_epsilon = mem_params_epsilon
 
     def _calc_grad_from_running_jac_grad(self, running_jac_grad, jp, next_loop_param_grad):
         """
