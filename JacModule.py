@@ -417,6 +417,127 @@ def test3():
                pred_mem_model=pred_mem_model,actor_model=actor_model,pred_env_model=pred_env_model,
                start_env_fn=start_env_fn,env_fn=env_fn, calc_agent_loss_fn=calc_agent_loss_fn,decay=0.3)
 
+def test_snake2(n_env, n_mem, n_batches, n_iters, n_test_iters, lr, pred_mem_model,pred_env_model,start_env_fn, env_fn, calc_agent_loss_fn,decay):
+    """
+    Like test_snake, but doesn't have an actor model, only an environment and a predictor
+    """
+
+    n_loop_values = n_mem
+
+    #the loop parameter is only the memory
+    mem = torch.randn(n_batches, n_loop_values) * .1
+    mem.requires_grad = True
+
+    def snake_loop_fn(in_data):
+        models_input = torch.cat((get_jac_param(mem),in_data),dim=1)
+        new_mem = pred_mem_model(models_input)
+
+        return new_mem
+
+
+    snake = Snake(snake_loop_fn, list(pred_mem_model.parameters()), mem,[],decay=decay)
+
+    all_model_params = list(pred_mem_model.parameters()) + list(pred_env_model.parameters())
+
+    optim = torch.optim.SGD(all_model_params, lr=lr)
+
+    hidden_env,env = start_env_fn(n_batches,0)
+
+    #the last gradiants from the mem over the pred_mem_model parameters
+    last_grads = None
+
+    #training
+    for i in range(n_iters):
+        with torch.no_grad():
+            optim.zero_grad()
+
+            if mem.grad is not None:
+                # mem is not in any optim, since we don't update the values based
+                # on the gradiant, but only use them for the snake, so we have to zero them manually
+                # here
+                mem.grad.zero_()
+
+        #calculate the next environment so we can compute loss
+        next_hidden_env,next_env = env_fn(n_batches, hidden_env, env, i)
+
+        mem_env = torch.cat((mem,env),dim=1)
+
+        next_penv = pred_env_model(mem_env)
+
+        loss = ((next_penv-next_env)**2).sum()
+
+        loss.backward()
+
+        with torch.no_grad():
+            if(last_grads is not None):
+                snake.update_param_grads(last_grads, mem.grad)
+
+            #the agent reacts to the current environment (env) with a new memory, action, and
+            #predicted environment
+            last_grads,next_mem = snake.run_jacobian(env)
+
+            if(i%199 == 0):
+                print(f'{i=}\n{next_mem=}\n{next_env=}\n{next_penv=}')
+                if((next_env-next_penv.abs()) < 0.5):
+                    print('good')
+                else:
+                    print('bad')
+                
+                if(i > 10000000):
+                    pdb.set_trace()
+            optim.step()
+
+            mem.copy_(next_mem)
+            env = next_env
+            hidden_env = next_hidden_env
+    # env = start_env
+
+    # #testing
+    # for i in range(n_test_iters):
+    #     in_data = env_fn(n_batches, env, action, i)
+
+def test4():
+    """
+    Simple pattern environment
+    """
+    def calc_agent_loss_fn(action,hidden_env,env):
+        loss = ((action-env)**2).detach()
+        return loss
+
+    def start_env_fn(n_batches,seed):
+        torch.manual_seed(seed)
+        return torch.arange(end=n_batches),torch.zeros((n_batches,1))
+    
+    def env_fn(batches, hidden_env, env, index):
+        #env = ((torch.remainder(hidden_env,2) == 0)) * 1.
+        env = ((torch.remainder(hidden_env,3) == 0) + (torch.remainder(hidden_env,5) == 0)) * 1.
+        #env = torch.ones_like(env) #H*CK!!!
+        hidden_env += 1
+        return hidden_env,env.unsqueeze(1)
+
+    n_batches = 1
+    n_env = 1
+    n_mem = 10
+    n_inp_values = n_env+n_mem
+    
+
+    # this corresponds to the memory the predictor can create to help it predict
+    pred_mem_model = torch.nn.Sequential(torch.nn.LayerNorm((n_mem+n_env,),elementwise_affine=False),
+                                         JacLinear(n_inp_values, n_mem))
+
+    # the prediction model tries to predict what the environment will be given the current
+    # memory, action and environment
+    pred_env_model = ZeroToOne(JacLinear(n_inp_values, n_env))
+
+    #H*CK to see what happens if we make the actor and environment model initially very interested in the memory
+    # with torch.no_grad():
+    #     actor_model.weight[0:n_mem] += 1.
+    #     pred_env_model.weight[0:n_mem] += 1.
+
+    test_snake2(n_env=n_env, n_mem=n_mem, n_batches=n_batches, n_iters=100000, n_test_iters=100, lr=1e-2,
+                pred_mem_model=pred_mem_model,pred_env_model=pred_env_model,
+                start_env_fn=start_env_fn,env_fn=env_fn, calc_agent_loss_fn=calc_agent_loss_fn,decay=0.3)
+
 def testx():
 
     def calc_agent_loss_fn(action,hidden_env,env):
@@ -462,5 +583,5 @@ def testx():
                start_env_fn=start_env_fn,env_fn=env_fn, calc_agent_loss_fn=calc_agent_loss_fn,decay=0.3)
 
 if __name__ == '__main__':
-    test3()
+    test4()
     
