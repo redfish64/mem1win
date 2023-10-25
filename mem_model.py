@@ -21,10 +21,10 @@ import JacModule as jm
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
-    def __init__(self, ndim, bias):
+    def __init__(self, ndim, bias,device='cpu'):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(ndim))
-        self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
+        self.weight = nn.Parameter(torch.ones(ndim,device=device))
+        self.bias = nn.Parameter(torch.zeros(ndim,device=device)) if bias else None
 
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
@@ -36,12 +36,12 @@ class CausalSelfAttention(nn.Module):
         assert config.n_embd % config.n_head == 0
 
         # key, query, value projections for all heads, but in a batch
-        self.c_attn =     jm.JacLinear(config.n_embd, 3 * config.n_embd, True, has_bias=config.bias)
+        self.c_attn =     jm.JacLinear(config.n_embd, 3 * config.n_embd, True, has_bias=config.bias,device=config.device)
         # output projection
-        self.c_proj =     jm.JacLinear(config.n_embd, config.n_embd, True, has_bias=config.bias)
+        self.c_proj =     jm.JacLinear(config.n_embd, config.n_embd, True, has_bias=config.bias,device=config.device)
 
-        self.c_mem_attn = jm.JacLinear(config.n_mem_embd, 3 * config.n_embd, False, has_bias=config.bias)
-        self.c_mem_proj = jm.JacLinear(config.n_embd, config.n_mem_embd, False, has_bias=config.bias)
+        self.c_mem_attn = jm.JacLinear(config.n_mem_embd, 3 * config.n_embd, False, has_bias=config.bias,device=config.device)
+        self.c_mem_proj = jm.JacLinear(config.n_embd, config.n_mem_embd, False, has_bias=config.bias,device=config.device)
 
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
@@ -63,11 +63,11 @@ class CausalSelfAttention(nn.Module):
                 
             # causal mask to ensure that attention is only applied to the left in the input sequence
             self.register_buffer("no_flash_attn_mask",
-                                 torch.tril(torch.ones(config.block_size,total_size),diagonal=config.n_memory_per_layer)
+                                 torch.tril(torch.ones(config.block_size,total_size,device=config.device),diagonal=config.n_memory_per_layer)
                                  .view(1, 1, config.block_size,total_size))
         else:
             self.register_buffer("attn_mask",
-                                 torch.tril(torch.ones(config.block_size,total_size),diagonal=config.n_memory_per_layer)
+                                 torch.tril(torch.ones(config.block_size,total_size,device=config.device),diagonal=config.n_memory_per_layer)
                                  .view(1, 1, config.block_size,total_size)) == 1
 
     def get_mem_params(self):
@@ -175,9 +175,9 @@ class MLP(nn.Module):
 
     def __init__(self, config, n_embd,requires_grad):
         super().__init__()
-        self.c_fc    = jm.JacLinear(n_embd, 4 * n_embd, requires_grad, has_bias=config.bias)
+        self.c_fc    = jm.JacLinear(n_embd, 4 * n_embd, requires_grad, has_bias=config.bias,device=config.device)
         self.gelu    = nn.GELU()
-        self.c_proj  = jm.JacLinear(4 * n_embd, n_embd, requires_grad, has_bias=config.bias)
+        self.c_proj  = jm.JacLinear(4 * n_embd, n_embd, requires_grad, has_bias=config.bias,device=config.device)
         self.dropout = nn.Dropout(config.dropout)
 
     def get_jac_params(self):
@@ -196,24 +196,25 @@ class Block(nn.Module):
         super().__init__()
         self.register_buffer('memory',torch.zeros((config.batch_size,
                                                    config.n_memory_per_layer,
-                                                   config.n_mem_embd),requires_grad=True))
+                                                   config.n_mem_embd),
+                                                  device=config.device,requires_grad=True))
 
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias,device=config.device)
         self.attn = CausalSelfAttention(self.memory,config)
-        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias,device=config.device)
         #TODO 3 do we really want layernorm for mem?
         #we don't use elementwise_affine because we don't want any parameters. If
         #we have parameters we need to make them compatible with JacModule, such as with
         #JacLinear. TODO 3 maybe make a JacLayerNorm with parameters?
-        self.mem_ln_1 = torch.nn.LayerNorm(config.n_mem_embd, elementwise_affine=False)
-        self.mem_ln_2 = torch.nn.LayerNorm(config.n_mem_embd, elementwise_affine=False)
+        self.mem_ln_1 = torch.nn.LayerNorm(config.n_mem_embd, elementwise_affine=False,device=config.device)
+        self.mem_ln_2 = torch.nn.LayerNorm(config.n_mem_embd, elementwise_affine=False,device=config.device)
         self.mlp = MLP(config,config.n_embd,True)
         self.mem_mlp = MLP(config,config.n_mem_embd,False)
         self.jac_grad_decay = config.jac_grad_decay
         self.batch_size = config.batch_size
         self.n_memory_per_layer = config.n_memory_per_layer
         self.n_mem_embd = config.n_mem_embd
-        self.mem_grad_multiplier = torch.tensor(config.mem_grad_multiplier)
+        self.mem_grad_multiplier = torch.tensor(config.mem_grad_multiplier,device=config.device)
         self.last_grads = None
 
         def loop_fn(x):
@@ -221,7 +222,7 @@ class Block(nn.Module):
             m = self.mem_mlp(self.mem_ln_2(m))
             return m
 
-        self.snake = jm.Snake(loop_fn,self.get_mem_params(), self.memory,[],config.jac_grad_decay,vmap_randomness='different')
+        self.snake = jm.Snake(loop_fn,self.get_mem_params(), self.memory,[],config.jac_grad_decay,device=config.device,vmap_randomness='different')
 
     def forward(self, x):
         x = x + self.attn(self.mem_ln_1(jm.get_jac_param(self.memory)),self.ln_1(x))
@@ -299,6 +300,7 @@ class GPTConfig:
     jac_grad_decay: float = 0.01
     no_flash: bool = False 
     mem_grad_multiplier: float = 1.0
+    device : str = 'cpu'
 
 class GPT(nn.Module):
 
@@ -309,13 +311,13 @@ class GPT(nn.Module):
         self.config = config
 
         self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
+            wte = nn.Embedding(config.vocab_size, config.n_embd,device=config.device),
+            wpe = nn.Embedding(config.block_size, config.n_embd,device=config.device),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = LayerNorm(config.n_embd, bias=config.bias),
+            ln_f = LayerNorm(config.n_embd, bias=config.bias,device=config.device),
         ))
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False,device=config.device)
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
         # This behavior is deprecated and will be an error in future versions"

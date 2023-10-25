@@ -73,7 +73,7 @@ class Snake(object):
 
     """
 
-    def __init__(self, loop_fn, model_params, loop_param, other_batch_indexed_params,device,decay=0.05, **jac_grad_kw):
+    def __init__(self, loop_fn, model_params, loop_param, other_batch_indexed_params,decay=0.05,device='cpu',**jac_grad_kw):
         super(Snake, self).__init__()
         self.loop_fn = loop_fn
         self.model_params = model_params
@@ -171,15 +171,15 @@ class Snake(object):
 
 
 class JacLinear(nn.Module):
-    def __init__(self, n_in, n_out, requires_grad=True, has_bias=True):
+    def __init__(self, n_in, n_out, requires_grad=True, has_bias=True,device='cpu'):
         super().__init__()
         self.n_in = n_in
         self.n_out = n_out
 
         self.weight = torch.nn.Parameter(
-            torch.randn((n_out, n_in)) * 0.1, requires_grad)
+            torch.randn((n_out, n_in),device=device) * 0.1, requires_grad)
         self.bias = torch.nn.Parameter(torch.zeros(
-            (n_out,)), requires_grad) if has_bias else None
+            (n_out,),device=device), requires_grad) if has_bias else None
 
     def get_jac_params(self):
         return [self.weight] + ([self.bias] if self.bias is not None else [])

@@ -428,9 +428,9 @@ def create_model_state(enc,parser,config):
                               batch_size=config.batch_size,n_memory_per_layer=config.n_memory_per_layer,
                               jac_grad_decay=config.jac_grad_decay,
                               no_flash=config.no_flash,
-                              mem_grad_multiplier=config.mem_grad_multiplier)
+                              mem_grad_multiplier=config.mem_grad_multiplier,
+                              device=config.device)
     m = model.GPT(gptconf)
-    m.to(config.device)
 
     if(config.random_batches):
         if config.single_train_file is None:
