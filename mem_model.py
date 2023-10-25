@@ -119,7 +119,12 @@ class CausalSelfAttention(nn.Module):
         return y
 
     def _calc_mem_out(self,mem,x):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+
+        B, T, C = x.size() # batch size of input (for jacobian this will always be one regardless of actualy batch size)
+        #, sequence length, embedding dimensionality (n_embd)
+
+        _,mT,mC = mem.size() 
+        
         
         #this is a copy of forward. The only changes are that we calculate q from the memory only, instead of
         #the input only in the forward method, and also we use no mask.
@@ -130,9 +135,9 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
-        _,mT,mC = mem.size()
-        
         mq, mk, mv = self.c_mem_attn(mem).split(self.n_embd, dim=2)
+        #TODO 2 only batch size of 1 works right now, because jacrev only provides input with a single item in the
+        #batch dimension, and mem will contain all batches
         mk = mk.view(B, mT, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         mq = mq.view(B, mT, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         mv = mv.view(B, mT, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
@@ -151,6 +156,8 @@ class CausalSelfAttention(nn.Module):
             #there is no mask for _calc_mem_out because we are dealing with memory grad changes which will
             #take effect next cycle.
             att = F.softmax(att, dim=-1)
+
+            #TODO 3 is dropout in mem a good idea?
             att = self.attn_dropout(att)
             y = att @ fv # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
 
@@ -187,19 +194,19 @@ class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.memory = jm.JacParameter(torch.zeros((config.batch_size,
+        self.register_buffer('memory',torch.zeros((config.batch_size,
                                                    config.n_memory_per_layer,
-                                                   config.n_mem_embd)),
-                                      True,
-                                      is_batch_indexed=True)
-                                      
+                                                   config.n_mem_embd),requires_grad=True))
 
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(self.memory,config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         #TODO 3 do we really want layernorm for mem?
-        self.mem_ln_1 = LayerNorm(config.n_mem_embd, bias=config.bias)
-        self.mem_ln_2 = LayerNorm(config.n_mem_embd, bias=config.bias)
+        #we don't use elementwise_affine because we don't want any parameters. If
+        #we have parameters we need to make them compatible with JacModule, such as with
+        #JacLinear. TODO 3 maybe make a JacLayerNorm with parameters?
+        self.mem_ln_1 = torch.nn.LayerNorm(config.n_mem_embd, elementwise_affine=False)
+        self.mem_ln_2 = torch.nn.LayerNorm(config.n_mem_embd, elementwise_affine=False)
         self.mlp = MLP(config,config.n_embd,True)
         self.mem_mlp = MLP(config,config.n_mem_embd,False)
         self.jac_grad_decay = config.jac_grad_decay
@@ -207,24 +214,25 @@ class Block(nn.Module):
         self.n_memory_per_layer = config.n_memory_per_layer
         self.n_mem_embd = config.n_mem_embd
         self.mem_grad_multiplier = torch.tensor(config.mem_grad_multiplier)
+        self.last_grads = None
 
-        all_mem_params = l_pred_mem_model_params + l_actor_model_params + l_pred_env_params
-        self.snake = jm.Snake(loop_fn, 
+        def loop_fn(x):
+            m = self.attn._calc_mem_out(self.mem_ln_1(jm.get_jac_param(self.memory)),self.ln_1(x))
+            m = self.mem_mlp(self.mem_ln_2(m))
+            return m
+
+        self.snake = jm.Snake(loop_fn,self.get_mem_params(), self.memory,[],config.jac_grad_decay,vmap_randomness='different')
 
     def forward(self, x):
         x = x + self.attn(self.mem_ln_1(jm.get_jac_param(self.memory)),self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
 
-    def _calc_mem_out(self,x):
-        m = self.attn._calc_mem_out(self.mem_ln_1(jm.get_jac_param(self.memory)),self.ln_1(x))
-        m = self.mem_mlp(self.mem_ln_2(m))
-        return m
-
     def get_mem_params(self):
         return (self.attn.get_mem_params() +
-                self.mem_ln_1.get_jac_params())
-                self.mem_ln_2.get_jac_params())
+                #co: no parameters for LayerNorm without elementwise_affine
+                #self.mem_ln_1.get_jac_params() + 
+                #self.mem_ln_2.get_jac_params() +
                 self.mem_mlp.get_jac_params())
         
     def get_out_params(self):
@@ -237,20 +245,21 @@ class Block(nn.Module):
         Also sets memory.grad to None
         x - x is the previous input used for forward()
         """
+        if(self.last_grads is not None):
+            self.snake.update_param_grads(self.last_grads,self.memory.grad)
+
+        self.last_grads, next_mem = self.snake.run_jacobian(x)
+
         jac_params = self.get_mem_params() + [self.memory]
 
-        #vmap_randomness is because scaled_dot_product_attention does randomness. Why? dunno.
-        new_mem = jm.jac_grad(self._calc_mem_out,x,jac_params,fake_one_row_batch=True,vmap_randomness='different')
-
-        for jp in jac_params:
-            #Note, if we start calculating grad for jac parameters during loss, we'll have to change
-            #this to +. For now, though, the grad is none, so plus wouldn't work and we just set it
-            #orig:
-            jp.grad = jp.calc_grad_from_running_jac_grad(self.memory.grad)
-            jp.update_running_jac_grad(self.jac_grad_decay,self.memory.jac_grad)
-            jp.grad *= self.mem_grad_multiplier 
+        if(self.mem_grad_multiplier != 1.):
+            for jp in jac_params:
+                #Note, if we start calculating grad for jac parameters during loss, we'll have to change
+                #this to +. For now, though, the grad is none, so plus wouldn't work and we just set it
+                #orig:
+                jp.grad *= self.mem_grad_multiplier 
         
-        self.memory.copy_(new_mem)
+        self.memory.copy_(next_mem)
 
         #the memory grad should have been calculated by backwards, and we used it above to calculate the jp.grads, but
         #we don't want to actually train it, since it doesn't represent an actual static parameter.
@@ -260,9 +269,7 @@ class Block(nn.Module):
     def save_and_reset_memory(self):
         """Returns current memory for running estimated loss, etc. and creates a clone all zeroed out """
         old_mem = self.memory
-        self.memory = jm.JacParameter(torch.zeros_like(self.memory),
-                                      True,
-                                      is_batch_indexed=True)
+        self.memory = torch.zeros_like(self.memory,requires_grad=True,device=old_mem.device)
         return old_mem
 
     def reset_memory(self):
@@ -478,7 +485,7 @@ class GPT(nn.Module):
         # start with all of the candidate parameters
         param_dict = {pn: p for pn, p in self.named_parameters()}
         # filter out those that do not require grad
-        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad or isinstance(p,jm.JacParameter)}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
         # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
         # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
         decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]

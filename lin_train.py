@@ -393,7 +393,7 @@ def init_argparse() -> argparse.ArgumentParser:
     train_parser.add_argument('--random_batches', action='store_true',help='True if we want to use random batches rather than go through the data sequentially. This will of course make the memory useless')
     train_parser.add_argument('--learning_rate', nargs='?',type=float,default=6e-4,help='learning rate for optimizer')
     train_parser.add_argument('--weight_decay', nargs='?',type=float,default=1e-1,help='GPT module parameter to try and force the weights closer to zero')
-    train_parser.add_argument('--jac_grad_decay', nargs='?',type=float,default=0.01,help='Amount to decay the effect of the previous cycles grads on the current learning step. From 0.0 to 1.0')
+    train_parser.add_argument('--jac_grad_decay', nargs='?',type=float,default=0.03,help='Amount to decay the effect of the previous cycles grads on the current learning step. From 0.0 to 1.0')
     train_parser.add_argument('--mem_grad_multiplier', nargs='?',type=float,default=1,help='Multiples the memory gradiants by this value before optimizing.')
     train_parser.add_argument('--beta1', nargs='?',type=float,default=0.9,help='AdamW parameter to control running average for momentum')
     train_parser.add_argument('--beta2', nargs='?',type=float,default=0.95,help='AdamW parameter to control running average for momentum')
@@ -588,6 +588,8 @@ def run_training(config,enc,ms):
                 tag += ag
                 cnt += 1
 
+        if(cnt == 0):
+            return 0
         return tag / cnt
 
     global stats

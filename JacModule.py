@@ -73,7 +73,7 @@ class Snake(object):
 
     """
 
-    def __init__(self, loop_fn, model_params, loop_param, other_batch_indexed_params,decay=0.05, **jac_grad_kw):
+    def __init__(self, loop_fn, model_params, loop_param, other_batch_indexed_params,device,decay=0.05, **jac_grad_kw):
         super(Snake, self).__init__()
         self.loop_fn = loop_fn
         self.model_params = model_params
@@ -82,11 +82,12 @@ class Snake(object):
         self.decay = decay
         self.jac_grad_kw = jac_grad_kw
         self.jac_params = [self.loop_param] + self.model_params
-        self.running_jac_grads = [torch.zeros(*loop_param.shape, *jp.shape) for jp in self.model_params]
+        self.running_jac_grads = [torch.zeros(*loop_param.shape, *jp.shape,device=device) for jp in self.model_params]
 
-    def _calc_grad_from_running_jac_grad(self, running_jac_grad, jp, next_loop_param_grad):
+    
+    def _calc_grad_for_cycle(self, running_jac_grad, jp, next_loop_param_grad):
         """
-        Figures out the grad for the given jacparameter.
+        Figures out the grad for a parameter for its previous cycles
         """
         # number of dimensions in the memory output
         n_loop_dims = next_loop_param_grad.dim()
@@ -140,16 +141,17 @@ class Snake(object):
         return grads,data_out
 
         
-    def update_param_grads(self, grads, next_loop_param_grad):
+    def update_param_grads(self, cycle_grads, next_loop_param_grad):
         """
-        Expects loss to be calculated relative to the parameters in init()
-        Will update the grad by the running jac grad for each parameter in the snake.
-        Also updates the running jac grad for each parameter. Should be called after
-        run_jacobian
+        Expects loss to be calculated relative to the parameters in init(). Moves the
+        cycle forward one iteration by updating the running_jac_grads by the cycle_grads param.
+        
+        Then it also updates the grad for each paramater by the running jac grad multiplied
+        by the next_loop_param_grad. Should be called after run_jacobian
         """
-        loop_param_jac_grad = grads[0]
+        loop_param_jac_grad = cycle_grads[0]
 
-        for index, jp_jac_grad in enumerate(grads[1:]):
+        for index, jp_jac_grad in enumerate(cycle_grads[1:]):
             jp = self.model_params[index]
             jp_running_jac_grad = self.running_jac_grads[index]
 
@@ -159,7 +161,7 @@ class Snake(object):
 
             #link the running_jac_grad which extends to the end of the current cycle to the next_loop_param.grad
             #which goes from the end of the current cycle to the result
-            running_portion_grad = self._calc_grad_from_running_jac_grad(jp_running_jac_grad, jp,next_loop_param_grad)
+            running_portion_grad = self._calc_grad_for_cycle(jp_running_jac_grad, jp,next_loop_param_grad)
             if jp.grad is None:
                 jp.grad = running_portion_grad
             else:
@@ -472,8 +474,6 @@ def test_snake2(n_env, n_mem, n_batches, n_iters, n_test_iters, lr, pred_mem_mod
             if(last_grads is not None):
                 snake.update_param_grads(last_grads, mem.grad)
 
-            #the agent reacts to the current environment (env) with a new memory, action, and
-            #predicted environment
             last_grads,next_mem = snake.run_jacobian(env)
 
             if(i%199 == 0):
