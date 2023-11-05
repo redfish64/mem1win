@@ -12,13 +12,14 @@ import os
 import pdb
 import matplotlib.pyplot as plt
 import mem_model as model
-import JacModule as jm
+import simple_mem_model as smm
+import util as u
 
 # the reason I copied util into this git tree is so that there is a consistent commit. When we run each
 # session, I want to record the git state along with all parameters, so that I can reproduce/track the results
 import util
 import gutenberg
-
+from typing import Callable
 
 class ModelTrailingAvgStats:
     def __init__(self,trailing_avg_perc):
@@ -356,7 +357,7 @@ def init_argparse() -> argparse.ArgumentParser:
         exit_on_error=True,
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+    command_subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
     shared_parser = argparse.ArgumentParser(add_help=False)
     shared_parser.add_argument('--bos', action='store_true', help='if set, will drop into a debugger on start')
@@ -365,43 +366,56 @@ def init_argparse() -> argparse.ArgumentParser:
     shared_parser.add_argument('--post_end_token', nargs='?', type=int,default=1, help='token to use to fill the buffer after the file ends.')
     shared_parser.add_argument('--device', nargs='?', default="cpu",help='device to run on (cpu or cuda)')
 
-    train_parser = subparsers.add_parser("train", help="Train a new or existing model", parents=[shared_parser])
+    train_parser = command_subparsers.add_parser("train", help="Train a new or existing model", parents=[shared_parser])
 
+    train_model_subparsers = train_parser.add_subparsers(dest="model", help="Available models")
     train_data_group = train_parser.add_mutually_exclusive_group(required=True)
     train_data_group.add_argument('--dir_tree',help='directory tree to look for zipped text files for training')
     train_data_group.add_argument('--single_train_file',help='single zipped file of training data. Don\'t make this too big, it\'s loaded into memory all at once.')
 
-    train_parser.add_argument('--batch_size', nargs='?', type=int,default=64,help='num of batches to process at once')
-    train_parser.add_argument('--block_size', nargs='?', type=int,default=256,help='block size in tokens. This along with memory_size decides the number of input params')
-    train_parser.add_argument('--n_loops', nargs='?', type=int,default=100,help='number of times to loop through data')
-    train_parser.add_argument('--n_head', nargs='?', type=int,default=6,help='number of heads per layer')
-    train_parser.add_argument('--n_embd', nargs='?', type=int,default=384,help='number of embedding dimensions')
-    train_parser.add_argument('--n_mem_embd', nargs='?', type=int,default=96,help='number of embedding dimensions for memory. These are more costly than normal embeddings due to the jacobian')
-    train_parser.add_argument('--n_memory_per_layer', nargs='?', type=int,default=8,help='number of memory values to store across cycles')
-    train_parser.add_argument('--dropout', nargs='?', type=float,default=0.2,help='dropout percentage')
-    train_parser.add_argument('--n_layer', nargs='?', type=int,default=6,help='number of layers')
-    train_parser.add_argument('--min_text_size', nargs='?', type=int,default=10000,help='min size of text files to process (others will be skipped)')
-    train_parser.add_argument('--max_text_size', nargs='?', type=int,default=1024*1024*10,help='max size of text files to process (others will be skipped)')
-    train_parser.add_argument('--trailing_avg_perc', nargs='?', type=float,default=0.01,help='only used for display. When printing status, we use a trailing avg. This is the percentage to keep from the previous runs, the remainder is for the current one.')
-    train_parser.add_argument('--test_dir_tree',nargs='?',help='directory tree to look for zipped text files for testing. All of these files will be run to estimate loss so don\'t add too many here')
-    train_parser.add_argument('--print_status_time', nargs='?',type=float,default=10,help='time between printing status updates and estimating loss in seconds')
-    train_parser.add_argument('--save_model_time', nargs='?',type=float,default=60*15,help='time between saving the model in seconds')
-    train_parser.add_argument('--est_loss_time', nargs='?',type=float,default=60,help='time between estimating the loss of the model in seconds')
-    train_parser.add_argument('--no_save', action='store_true',help='won\'t save the model automatically. The model can still be saved by interrupt')
-    train_parser.add_argument('--no_bias', action='store_true',help='GPT param, whether to have a bias or not. GPT creator seems to think it\'s better not to have')
-    train_parser.add_argument('--no_flash', action='store_true',help='True if scaled_dot_product_attention function shouldn\'t be used even if available')
-    train_parser.add_argument('--random_batches', action='store_true',help='True if we want to use random batches rather than go through the data sequentially. This will of course make the memory useless')
-    train_parser.add_argument('--learning_rate', nargs='?',type=float,default=6e-4,help='learning rate for optimizer')
-    train_parser.add_argument('--weight_decay', nargs='?',type=float,default=1e-1,help='GPT module parameter to try and force the weights closer to zero')
-    train_parser.add_argument('--jac_grad_decay', nargs='?',type=float,default=0.03,help='Amount to decay the effect of the previous cycles grads on the current learning step. From 0.0 to 1.0')
-    train_parser.add_argument('--mem_grad_multiplier', nargs='?',type=float,default=1,help='Multiples the memory gradiants by this value before optimizing.')
-    train_parser.add_argument('--beta1', nargs='?',type=float,default=0.9,help='AdamW parameter to control running average for momentum')
-    train_parser.add_argument('--beta2', nargs='?',type=float,default=0.95,help='AdamW parameter to control running average for momentum')
-    train_parser.add_argument('--load_model', nargs='?',help='load a previously generated model')
-    train_parser.add_argument('--save_model_filename', nargs='?',help='name to save model after training (or interrupt)')
-    train_parser.add_argument('--log_config_file', nargs='?',default='logging.conf',help='log config file, see: https://docs.python.org/3/howto/logging.html#configuring-logging')
+    train_shared_parser = argparse.ArgumentParser(add_help=False)
+    train_shared_parser.add_argument('--batch_size', nargs='?', type=int,default=64,help='num of batches to process at once')
+    train_shared_parser.add_argument('--n_loops', nargs='?', type=int,default=100,help='number of times to loop through data')
 
-    imagine_parser = subparsers.add_parser("imagine", help="Imagine the rest of a story", parents=[shared_parser])
+    train_shared_parser.add_argument('--min_text_size', nargs='?', type=int,default=10000,help='min size of text files to process (others will be skipped)')
+    train_shared_parser.add_argument('--max_text_size', nargs='?', type=int,default=1024*1024*10,help='max size of text files to process (others will be skipped)')
+    train_shared_parser.add_argument('--trailing_avg_perc', nargs='?', type=float,default=0.01,help='only used for display. When printing status, we use a trailing avg. This is the percentage to keep from the previous runs, the remainder is for the current one.')
+    train_shared_parser.add_argument('--test_dir_tree',nargs='?',help='directory tree to look for zipped text files for testing. All of these files will be run to estimate loss so don\'t add too many here')
+    train_shared_parser.add_argument('--print_status_time', nargs='?',type=float,default=10,help='time between printing status updates and estimating loss in seconds')
+    train_shared_parser.add_argument('--save_model_time', nargs='?',type=float,default=60*15,help='time between saving the model in seconds')
+    train_shared_parser.add_argument('--est_loss_time', nargs='?',type=float,default=60,help='time between estimating the loss of the model in seconds')
+    train_shared_parser.add_argument('--no_save', action='store_true',help='won\'t save the model automatically. The model can still be saved by interrupt')
+    train_shared_parser.add_argument('--random_batches', action='store_true',help='True if we want to use random batches rather than go through the data sequentially. This will of course make the memory useless')
+    train_shared_parser.add_argument('--learning_rate', nargs='?',type=float,default=6e-4,help='learning rate for optimizer')
+    train_shared_parser.add_argument('--load_model', nargs='?',help='load a previously generated model')
+    train_shared_parser.add_argument('--save_model_filename', nargs='?',help='name to save model after training (or interrupt)')
+    train_shared_parser.add_argument('--log_config_file', nargs='?',default='logging.conf',help='log config file, see: https://docs.python.org/3/howto/logging.html#configuring-logging')
+
+    gpt_train_parser = train_model_subparsers.add_parser("gpt", help="GPT transformer model with memory", parents=[train_shared_parser])
+    gpt_train_parser.add_argument('--block_size', nargs='?', type=int,default=256,help='block size in tokens.')
+    gpt_train_parser.add_argument('--n_head', nargs='?', type=int,default=6,help='number of heads per layer')
+    gpt_train_parser.add_argument('--n_embd', nargs='?', type=int,default=384,help='number of embedding dimensions')
+    gpt_train_parser.add_argument('--n_mem_embd', nargs='?', type=int,default=96,help='number of embedding dimensions for memory. These are more costly than normal embeddings due to the jacobian')
+    gpt_train_parser.add_argument('--n_memory_per_layer', nargs='?', type=int,default=8,help='number of memory values to store across cycles')
+    gpt_train_parser.add_argument('--dropout', nargs='?', type=float,default=0.2,help='dropout percentage')
+    gpt_train_parser.add_argument('--n_layer', nargs='?', type=int,default=6,help='number of layers')
+    gpt_train_parser.add_argument('--no_bias', action='store_true',help='GPT param, whether to have a bias or not. GPT creator seems to think it\'s better not to have')
+    gpt_train_parser.add_argument('--no_flash', action='store_true',help='True if scaled_dot_product_attention function shouldn\'t be used even if available')
+    gpt_train_parser.add_argument('--weight_decay', nargs='?',type=float,default=1e-1,help='GPT module parameter to try and force the weights closer to zero')
+    gpt_train_parser.add_argument('--jac_grad_decay', nargs='?',type=float,default=0.03,help='Amount to decay the effect of the previous cycles grads on the current learning step. From 0.0 to 1.0')
+    gpt_train_parser.add_argument('--mem_grad_multiplier', nargs='?',type=float,default=1,help='Multiples the memory gradiants by this value before optimizing.')
+    gpt_train_parser.add_argument('--beta1', nargs='?',type=float,default=0.9,help='AdamW parameter to control running average for momentum')
+    gpt_train_parser.add_argument('--beta2', nargs='?',type=float,default=0.95,help='AdamW parameter to control running average for momentum')
+    
+    smm_train_parser = train_model_subparsers.add_parser("smm", help="Simple classic deep learning model with memory", parents=[train_shared_parser])
+    smm_train_parser.add_argument('--block_size', nargs='?', type=int,default=1,help='block size in tokens.')
+    smm_train_parser.add_argument('--n_embd', nargs='?', type=int,default=64,help='number of embedding dimensions')
+    smm_train_parser.add_argument('--n_memory', nargs='?', type=int,default=64,help='number of memory values to store across cycles')
+    smm_train_parser.add_argument('--n_inner_mem_size', nargs='?', type=int,default=64,help='the base number of nodes in the memory hidden layer. actual number of nodes is this x n_embd x n_inp_window')
+    smm_train_parser.add_argument('--n_inner_pred_size', nargs='?', type=int,default=64,help='the base number of nodes in the predicition hidden layer. actual number of nodes is this x n_embd x n_inp_window')
+    smm_train_parser.add_argument('--jac_grad_decay', nargs='?',type=float,default=0.03,help='Amount to decay the effect of the previous cycles grads on the current learning step. From 0.0 to 1.0')
+    
+    imagine_parser = command_subparsers.add_parser("imagine", help="Imagine the rest of a story", parents=[shared_parser])
     imagine_parser.add_argument('--perc', nargs='?', type=float,default=0.5,help='amount of story to read before starting to imagine the rest')
     imagine_parser.add_argument('--load_model', required=True, help='load a previously generated model')
     imagine_parser.add_argument('--zip_file', required=True, help='zipped txt file containing story')
@@ -414,6 +428,7 @@ class ModelState(NamedTuple):
     test_wl: WorkLoader
     optimizer: torch.optim.Optimizer
     config: argparse.Namespace
+    get_stats : Callable
 
 def create_files_iter_fn(dt):
     return lambda: glob.iglob(f'{dt}/**/*.zip',recursive=True)
@@ -451,7 +466,50 @@ def create_model_state(enc,parser,config):
     else:
         test_wl = None
 
-    return ModelState(m,wl,test_wl,optimizer,config)
+    def get_stats(ms):
+        memory_vec_lengths = [torch.norm(b.memory).item() for b in ms.mdl.transformer.h],
+        avg_memory_vec_length = sum(memory_vec_lengths)/len(memory_vec_lengths)
+
+        return {
+            'mem_avg_grad': u.get_avg_abs_grad(ms.mdl.get_mem_params()),
+            'out_avg_grad': u.get_avg_abs_grad(ms.mdl.get_out_params()),
+            'memory_vec_lengths': memory_vec_lengths,
+            'avg_memory_vec_length': avg_memory_vec_length}
+
+    return ModelState(m,wl,test_wl,optimizer,config,get_stats)
+
+def create_smm_model_state(enc,parser,config):
+
+    simpleconf = smm.SMMConfig(batch_size=config.batch_size,
+                               n_memory=config.n_memory,
+                               vocab_size=config.vocab_size,
+                               n_embd=config.n_embd,
+                               block_size=config.block_size,
+                               n_inner_mem_size=config.n_inner_mem_size,
+                               n_inner_pred_size=config.n_inner_pred_size,
+                               jac_grad_decay=config.jac_grad_decay,
+                               device=config.device)
+    m = smm.SimpleMemModel(simpleconf)
+
+    optimizer = m.configure_optimizers(config.learning_rate)
+
+    wl = WorkLoader(enc,{},create_files_iter_fn(config.dir_tree),config.batch_size,config.block_size,config.n_loops,config.device,config.pre_start_token,config.post_end_token,config.min_text_size,config.max_text_size,update_global_stats=True)
+
+    if(config.test_dir_tree is not None):
+        #TODO 3 HACK we are limiting the batch size to 1, since if there aren't enough files to fill all the batches
+        #then WorkLoader will return empty batch items for the missing ones which can really screw up the
+        #estimated loss
+        test_wl = WorkLoader(enc,{},create_files_iter_fn(config.test_dir_tree),1,config.block_size,1,config.device,config.pre_start_token,config.post_end_token,config.min_text_size,config.max_text_size,update_global_stats=False)
+    else:
+        test_wl = None
+
+    def get_stats(ms):
+
+        return {
+            'mem_avg_grad': u.get_avg_abs_grad(ms.mdl.get_mem_params()),
+            'out_avg_grad': u.get_avg_abs_grad(ms.mdl.get_out_params())}
+
+    return ModelState(m,wl,test_wl,optimizer,config,get_stats)
 
 
 def choose_new_filename(filename):
@@ -579,19 +637,6 @@ def run_training(config,enc,ms):
         save_model_state(ms,stats)
         pdb.set_trace()
 
-    def get_avg_abs_grad(params):
-        tag = 0.
-        cnt = 0 
-        for p in params:
-            if(p.grad is not None):
-                ag = p.grad.abs().mean().item()
-                tag += ag
-                cnt += 1
-
-        if(cnt == 0):
-            return 0
-        return tag / cnt
-
     global stats
     stats = ModelStats(config.trailing_avg_perc)                        
     stats.last_save_time = time.time()
@@ -604,19 +649,14 @@ def run_training(config,enc,ms):
             logits,loss,last_item_loss = ms.mdl(batch,targets)
             ms.optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            ms.mdl.update_memory_and_mem_params()
-            mem_avg_grad = get_avg_abs_grad(ms.mdl.get_mem_params())
-            out_avg_grad = get_avg_abs_grad(ms.mdl.get_out_params())
-            memory_vec_lengths = [torch.norm(b.memory).item() for b in ms.mdl.transformer.h]
-            avg_memory_vec_length = sum(memory_vec_lengths)/len(memory_vec_lengths)
-            ms.optimizer.step() # TODO 2 make sure that optimizer has right params
+            ms.mdl.update_memory_and_mem_params(batch)
+            ms.optimizer.step()
+
+            ms_stats = ms.get_stats(ms)
 
             print_status(ms,config.print_status_time,
                          {'loss' : loss,
-                          'last_item_loss' : last_item_loss,
-                          'mem_avg_grad' : mem_avg_grad,
-                          'out_avg_grad' : out_avg_grad,
-                          'avg_mem_vec' : avg_memory_vec_length})
+                          'last_item_loss' : last_item_loss} | ms_stats)
             
             if(time.time() - stats.last_save_time >= config.save_model_time):
                 save_model_state(ms,stats)
@@ -639,7 +679,10 @@ def main():
         print(f"loading model {config.load_model}")
         (ms,stats) = load_model_state(config.load_model,enc,config)
     else:
-        ms = create_model_state(enc,parser,config)
+        if(config.model == 'gpt'):
+            ms = create_model_state(enc,parser,config)
+        else:
+            ms = create_smm_model_state(enc,parser,config)
 
     print(sum(p.numel() for p in ms.mdl.parameters())/1e6, 'M parameters')
     if(config.bos):

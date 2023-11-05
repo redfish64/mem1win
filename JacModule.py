@@ -67,6 +67,8 @@ def get_jac_param(jp):
     # to the jac_grad function
     return jp.jac_param if hasattr(jp, 'jac_param') else jp
 
+# #H*CK
+# no_count = 0
 
 class Snake(object):
     """
@@ -122,9 +124,22 @@ class Snake(object):
         # calc the effect on the previous cycles relative to the current cycle loop_param out
         res = u.matmul_batch_ldim_tensors(loop_param_jac_grad, split_point, jp_running_jac_grad, split_point)
 
+        # #H*CK
+        # rm = res.abs().mean() 
+        # jrm = jp_running_jac_grad.abs().mean() 
+        # lpjgm = loop_param_jac_grad.abs().mean()
+        # global no_count
+        # if(rm > jrm):
+        #     print(f"YES {no_count=},{rm=},{jrm=},{lpjgm=}")
+        #     no_count = 0
+        # else:
+        #     no_count += 1
+
+
         # average that with the current cycle effect using a given percentage, named decay
-        return res * \
-            (1. - self.decay) + jp_jac_grad * self.decay
+        res = res * (1. - self.decay) + jp_jac_grad * self.decay
+
+        return res
 
     def run_jacobian(self, in_data):
         """
@@ -158,6 +173,8 @@ class Snake(object):
             #update the running_jac_grad to the end of the current cycle
             jp_running_jac_grad = self._calc_running_jac_grad(
                 loop_param_jac_grad, jp_running_jac_grad, jp_jac_grad)
+            
+            self.running_jac_grads[index] = jp_running_jac_grad
 
             #link the running_jac_grad which extends to the end of the current cycle to the next_loop_param.grad
             #which goes from the end of the current cycle to the result
@@ -167,7 +184,6 @@ class Snake(object):
             else:
                 jp.grad += running_portion_grad
 
-            self.running_jac_grads[index] = jp_running_jac_grad
 
 
 class JacLinear(nn.Module):

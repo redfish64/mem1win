@@ -16,6 +16,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 import pdb
 import JacModule as jm
+import util as u
 
 
 class LayerNorm(nn.Module):
@@ -36,12 +37,18 @@ class CausalSelfAttention(nn.Module):
         assert config.n_embd % config.n_head == 0
 
         # key, query, value projections for all heads, but in a batch
-        self.c_attn =     jm.JacLinear(config.n_embd, 3 * config.n_embd, True, has_bias=config.bias,device=config.device)
+        self.c_attn =     jm.JacLinear(config.n_embd, 3 * config.n_embd, requires_grad=True, has_bias=config.bias,device=config.device)
         # output projection
-        self.c_proj =     jm.JacLinear(config.n_embd, config.n_embd, True, has_bias=config.bias,device=config.device)
+        self.c_proj =     jm.JacLinear(config.n_embd, config.n_embd, requires_grad=True, has_bias=config.bias,device=config.device)
 
-        self.c_mem_attn = jm.JacLinear(config.n_mem_embd, 3 * config.n_embd, False, has_bias=config.bias,device=config.device)
-        self.c_mem_proj = jm.JacLinear(config.n_embd, config.n_mem_embd, False, has_bias=config.bias,device=config.device)
+        # TOOD 3 we are setting requires_grad to True, because if its false, its not picked up by the optimizer
+        # the optimizer is also responsible for zeroing out the grads after each cycle which is necessary or the
+        # mem grads will blow up.
+        # Not sure if it honestly should be true or not. If it is true, than the straight param to loss (without
+        # going through memory) pathway will be added in. But this should really only affect memory, I guess, so
+        # dunno?
+        self.c_mem_attn = jm.JacLinear(config.n_mem_embd, 3 * config.n_embd, requires_grad=True, has_bias=config.bias,device=config.device)
+        self.c_mem_proj = jm.JacLinear(config.n_embd, config.n_mem_embd, requires_grad=True, has_bias=config.bias,device=config.device)
 
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
@@ -206,8 +213,7 @@ class Block(nn.Module):
         #we don't use elementwise_affine because we don't want any parameters. If
         #we have parameters we need to make them compatible with JacModule, such as with
         #JacLinear. TODO 3 maybe make a JacLayerNorm with parameters?
-        self.mem_ln_1 = torch.nn.LayerNorm(config.n_mem_embd, elementwise_affine=False,device=config.device)
-        self.mem_ln_2 = torch.nn.LayerNorm(config.n_mem_embd, elementwise_affine=False,device=config.device)
+        self.mem_ln = torch.nn.LayerNorm(config.n_mem_embd, elementwise_affine=False,device=config.device)
         self.mlp = MLP(config,config.n_embd,True)
         self.mem_mlp = MLP(config,config.n_mem_embd,False)
         self.jac_grad_decay = config.jac_grad_decay
@@ -218,14 +224,14 @@ class Block(nn.Module):
         self.last_grads = None
 
         def loop_fn(x):
-            m = self.attn._calc_mem_out(self.mem_ln_1(jm.get_jac_param(self.memory)),self.ln_1(x))
-            m = self.mem_mlp(self.mem_ln_2(m))
+            m = self.attn._calc_mem_out(self.mem_ln(jm.get_jac_param(self.memory)),self.ln_1(x))
+            m = self.mem_ln(self.mem_mlp(self.mem_ln(m)))
             return m
 
         self.snake = jm.Snake(loop_fn,self.get_mem_params(), self.memory,[],config.jac_grad_decay,device=config.device,vmap_randomness='different')
 
     def forward(self, x):
-        x = x + self.attn(self.mem_ln_1(jm.get_jac_param(self.memory)),self.ln_1(x))
+        x = x + self.attn(jm.get_jac_param(self.memory),self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -255,9 +261,6 @@ class Block(nn.Module):
 
         if(self.mem_grad_multiplier != 1.):
             for jp in jac_params:
-                #Note, if we start calculating grad for jac parameters during loss, we'll have to change
-                #this to +. For now, though, the grad is none, so plus wouldn't work and we just set it
-                #orig:
                 jp.grad *= self.mem_grad_multiplier 
         
         self.memory.copy_(next_mem)
@@ -283,7 +286,7 @@ class Block(nn.Module):
 
     def reset_memory_for_item_in_batch(self,index):
         with torch.no_grad():
-            self.memory[index] *= 0.
+            self.memory[index].zero_()
 
 @dataclass
 class GPTConfig:
@@ -410,7 +413,7 @@ class GPT(nn.Module):
 
         return logits, loss, last_item_loss
 
-    def update_memory_and_mem_params(self):
+    def update_memory_and_mem_params(self,x):
         with torch.no_grad():
             for block,x in zip(self.transformer.h,self.last_block_xs):
                 block.update_memory_and_mem_params(x)
@@ -551,3 +554,5 @@ class GPT(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
+
+

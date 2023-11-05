@@ -344,3 +344,20 @@ def matmul_batch_ldim_tensors(a,a_split_point,b,b_split_point):
     res = torch.bmm(av,bv)
 
     return res.view(*(a.shape[0:a_split_point]+b.shape[b_split_point:]))
+
+def get_avg_abs_grad(params):
+    """
+    Returns the average absolute value of grads of the given parameters
+    """
+    tag = 0.
+    cnt = 0 
+    for p in params:
+        if(p.grad is not None):
+            ag = p.grad.abs().mean().item()
+            tag += ag
+            cnt += 1
+
+    if(cnt == 0):
+        return 0
+    return tag / cnt
+
