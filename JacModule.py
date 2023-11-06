@@ -106,12 +106,13 @@ class Snake(object):
 
     def _calc_running_jac_grad(self, loop_param_jac_grad, jp_running_jac_grad, jp_jac_grad):
         """
-        This updates the jac gradiant for a cycle through the model. It takes the existing running gradiant and averages
-        it with the current gradiant. This way we get an estimation of how a parameter affects the output of
-        the current round from all prior rounds.
+        This returns a value which can be used for the new jp_running_jac_grad 
 
-        decay - how much to decay the previous old gradiants when updating, a value from 0 to 1.
-        cycle_out_to_cycle_out - the gradiant from how the output of the last cycle affects the current one
+        loop_param_jac_grad - The loop_param is the memory of the nn, which gets cycled over and over. The jac_grad
+        of it is how each of the outputs change for each of the inputs
+        jp_running_jac_grad - This is how each of the loop_param outputs change vs each of the parameters wrt the previous
+                              cycles multiplied by their respective decay and added together
+        jp_jac_grad - This is how the loop_param outputs change vs parameters of the model, wrt the current loop.
         """
         #The split point is the position in the shape where out params end and the in params start.
         #There are two factos to consider here.
