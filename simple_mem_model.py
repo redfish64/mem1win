@@ -24,7 +24,9 @@ class SimpleMemModel(nn.Module):
             nn.ReLU(),
             jm.JacLinear(n_mem_hidden, n_mem_hidden,device=config.device),
             nn.ReLU(),
-            jm.JacLinear(n_mem_hidden, config.n_memory,device=config.device))
+            jm.JacLinear(n_mem_hidden, config.n_memory,device=config.device),
+            nn.Sigmoid())
+        
 
         n_pred_inp = config.n_memory + config.block_size * config.n_embd
         n_pred_hidden = config.n_inner_pred_size
