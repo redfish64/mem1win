@@ -11,9 +11,12 @@ import re
 import os
 import pdb
 import matplotlib.pyplot as plt
-import mem_model as model
+import mem_model as mm
+import mem_model2 as mm2
 import simple_mem_model as smm
 import util as u
+import JacModule as jm
+import plugin_mem_model as pmm
 
 # the reason I copied util into this git tree is so that there is a consistent commit. When we run each
 # session, I want to record the git state along with all parameters, so that I can reproduce/track the results
@@ -420,6 +423,19 @@ def init_argparse() -> argparse.ArgumentParser:
     imagine_parser.add_argument('--load_model', required=True, help='load a previously generated model')
     imagine_parser.add_argument('--zip_file', required=True, help='zipped txt file containing story')
 
+    # gpt_mm_train_parser = train_model_subparsers.add_parser("gpt_mm", help="gpt model with tacked on simple neural net to control memory", parents=[train_shared_parser])
+    # smm_train_parser.add_argument('--block_size', nargs='?', type=int,default=1,help='block size in tokens.')
+    # smm_train_parser.add_argument('--n_embd', nargs='?', type=int,default=64,help='number of embedding dimensions')
+    # smm_train_parser.add_argument('--n_memory', nargs='?', type=int,default=64,help='number of memory values to store across cycles')
+    # smm_train_parser.add_argument('--n_inner_mem_size', nargs='?', type=int,default=64,help='the base number of nodes in the memory hidden layer. actual number of nodes is this x n_embd x n_inp_window')
+    # smm_train_parser.add_argument('--n_inner_pred_size', nargs='?', type=int,default=64,help='the base number of nodes in the predicition hidden layer. actual number of nodes is this x n_embd x n_inp_window')
+    # smm_train_parser.add_argument('--jac_grad_decay', nargs='?',type=float,default=0.03,help='Amount to decay the effect of the previous cycles grads on the current learning step. From 0.0 to 1.0')
+    
+    imagine_parser = command_subparsers.add_parser("imagine", help="Imagine the rest of a story", parents=[shared_parser])
+    imagine_parser.add_argument('--perc', nargs='?', type=float,default=0.5,help='amount of story to read before starting to imagine the rest')
+    imagine_parser.add_argument('--load_model', required=True, help='load a previously generated model')
+    imagine_parser.add_argument('--zip_file', required=True, help='zipped txt file containing story')
+
     return parser
 
 class ModelState(NamedTuple):
@@ -438,14 +454,14 @@ def create_model_state(enc,parser,config):
 
     #max_token_value is one less than the vocab size as far as I can tell, see:
     #https://github.com/openai/tiktoken/blob/7830ed537badecefb5a357448be722bfd58f9fca/tiktoken/core.py
-    gptconf = model.GPTConfig(block_size=config.block_size,vocab_size=config.vocab_size,n_layer=config.n_layer,
-                              n_head=config.n_head,n_mem_embd=config.n_mem_embd,n_embd=config.n_embd,dropout=config.dropout,bias=not config.no_bias,
-                              batch_size=config.batch_size,n_memory_per_layer=config.n_memory_per_layer,
-                              jac_grad_decay=config.jac_grad_decay,
-                              no_flash=config.no_flash,
-                              mem_grad_multiplier=config.mem_grad_multiplier,
-                              device=config.device)
-    m = model.GPT(gptconf)
+    gptconf = mm.GPTConfig(block_size=config.block_size,vocab_size=config.vocab_size,n_layer=config.n_layer,
+                           n_head=config.n_head,n_mem_embd=config.n_mem_embd,n_embd=config.n_embd,dropout=config.dropout,bias=not config.no_bias,
+                           batch_size=config.batch_size,n_memory_per_layer=config.n_memory_per_layer,
+                           jac_grad_decay=config.jac_grad_decay,
+                           no_flash=config.no_flash,
+                           mem_grad_multiplier=config.mem_grad_multiplier,
+                           device=config.device)
+    m = mm.GPT(gptconf)
 
     if(config.random_batches):
         if config.single_train_file is None:
@@ -508,6 +524,68 @@ def create_smm_model_state(enc,parser,config):
         return {
             'mem_avg_grad': u.get_avg_abs_grad(ms.mdl.get_mem_params()),
             'out_avg_grad': u.get_avg_abs_grad(ms.mdl.get_out_params())}
+
+    return ModelState(m,wl,test_wl,optimizer,config,get_stats)
+
+def create_gpt_mm_model_state(enc,parser,config):
+
+    #max_token_value is one less than the vocab size as far as I can tell, see:
+    #https://github.com/openai/tiktoken/blob/7830ed537badecefb5a357448be722bfd58f9fca/tiktoken/core.py
+    gptconf = mm2.GPTConfig(block_size=config.mem_size+config.block_size,vocab_size=config.vocab_size,n_layer=config.n_layer,
+                            n_head=config.n_head,n_mem_embd=config.n_mem_embd,
+                            n_embd=config.n_embd,dropout=config.dropout,bias=not config.no_bias,
+                            batch_size=config.batch_size,n_memory_per_layer=config.n_memory_per_layer,
+                            jac_grad_decay=config.jac_grad_decay,
+                            no_flash=config.no_flash,
+                            mem_grad_multiplier=config.mem_grad_multiplier,
+                            device=config.device
+                            )
+    pred_model = mm.GPT(gptconf)
+
+    if config.dir_tree is None:
+        parser.error("--dir_tree is required when --random_batches is false.")
+    wl = WorkLoader(enc,{},create_files_iter_fn(config.dir_tree),config.batch_size,config.block_size,config.n_loops,config.device,config.pre_start_token,config.post_end_token,config.min_text_size,config.max_text_size,update_global_stats=True)
+
+    #TODO fixme for mem model, we need it to cover mem model
+    optimizer = mm2.configure_optimizers(config.weight_decay, config.learning_rate, (config.beta1, config.beta2), config.device)
+
+    n_mem_inp = config.n_memory + config.block_size * config.n_embd
+    n_mem_hidden = config.n_inner_mem_size
+
+    mem_model = nn.Sequential(
+        jm.JacLinear(n_mem_inp, n_mem_hidden,device=config.device),
+        nn.ReLU(),
+        jm.JacLinear(n_mem_hidden, n_mem_hidden,device=config.device),
+        nn.ReLU(),
+        jm.JacLinear(n_mem_hidden, config.n_memory,device=config.device),
+        nn.Sigmoid())
+
+    pmm_config = pmm.PMMConfig(batch_size=config.batch_size,
+                               n_memory = config.n_memory,
+                               vocab_size=config.vocab_size,
+                               block_size=config.block_size,
+                               jac_grad_decay= config.jac_grad_decay,
+                               device=config.device)
+
+    m = pmm.PluginMemModel(pmm_config,mem_model,pred_model)
+
+    if(config.test_dir_tree is not None):
+        #TODO 3 HACK we are limiting the batch size to 1 for testing, since if there
+        #aren't enough files to fill all the batches then WorkLoader will return empty
+        #batch items for the missing ones which can really screw up the estimated loss
+        test_wl = WorkLoader(enc,{},create_files_iter_fn(config.test_dir_tree),1,config.block_size,1,config.device,config.pre_start_token,config.post_end_token,config.min_text_size,config.max_text_size,update_global_stats=False)
+    else:
+        test_wl = None
+
+    def get_stats(ms):
+        memory_vec_lengths = [torch.norm(b.memory).item() for b in ms.mdl.transformer.h],
+        avg_memory_vec_length = sum(memory_vec_lengths)/len(memory_vec_lengths)
+
+        return {
+            'mem_avg_grad': u.get_avg_abs_grad(ms.mdl.get_mem_params()),
+            'out_avg_grad': u.get_avg_abs_grad(ms.mdl.get_out_params()),
+            'memory_vec_lengths': memory_vec_lengths,
+            'avg_memory_vec_length': avg_memory_vec_length}
 
     return ModelState(m,wl,test_wl,optimizer,config,get_stats)
 
@@ -681,8 +759,10 @@ def main():
     else:
         if(config.model == 'gpt'):
             ms = create_model_state(enc,parser,config)
-        else:
+        elif(config.model == 'smm'):
             ms = create_smm_model_state(enc,parser,config)
+        else:
+            ms = create_gpt_smm_model_state(enc,parser,confgi)
 
     print(sum(p.numel() for p in ms.mdl.parameters())/1e6, 'M parameters')
     if(config.bos):

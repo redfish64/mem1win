@@ -82,8 +82,6 @@ class SimpleMemModel(nn.Module):
             last_item_loss = None
 
         return logits, loss, last_item_loss
-        
-        return res
 
     def update_memory_and_mem_params(self,x):
         with torch.no_grad():
