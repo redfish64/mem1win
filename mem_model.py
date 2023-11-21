@@ -305,6 +305,7 @@ class GPTConfig:
     mem_grad_multiplier: float = 1.0
     device : str = 'cpu'
 
+
 class GPT(nn.Module):
 
     def __init__(self, config):

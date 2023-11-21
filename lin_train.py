@@ -13,10 +13,12 @@ import pdb
 import matplotlib.pyplot as plt
 import mem_model as mm
 import mem_model2 as mm2
+import model as om #original nanoGPT model
 import simple_mem_model as smm
 import util as u
 import JacModule as jm
 import plugin_mem_model as pmm
+import numpy as np
 
 # the reason I copied util into this git tree is so that there is a consistent commit. When we run each
 # session, I want to record the git state along with all parameters, so that I can reproduce/track the results
@@ -97,6 +99,56 @@ class CurrentWork():
         self.fn = fn
         self.block_pos = 0
         self.offset = offset
+
+class SingleSequentialWorkLoader():
+    """
+    loads batches in sequential order from a single file. Will use different offsets for different batches, and will
+    cut off beginning or end of text if there is only a partial block left.
+    """
+
+    def __init__(self,data_tensor,batch_size,block_size,num_loops,device):
+        self.data_tensor = data_tensor
+        self.data_len = data_tensor.shape[0]
+        self.batch_size = batch_size
+        self.block_size = block_size
+        self.device = device
+
+        #choose an approx number of batches that match number of loops for non random training
+        self.num_batches = num_loops * len(data_tensor) // self.block_size // self.batch_size
+        self.curr_loop = 0
+        self.curr_pos = 0
+
+        #probably a little conservative, but who cares?
+        assert(self.data_len >= 3 * (self.block_size + self.batch_size+1))
+        
+    def reset(self):
+        self.curr_loop=0
+        self.curr_pos=0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if(self.curr_loop >= self.num_batches):
+            raise StopIteration
+
+        input_data = [self.data_tensor[start:start+self.block_size] for start in range(self.curr_pos,self.curr_pos+self.batch_size)]
+        input_data = torch.stack(input_data)
+        target_data = [self.data_tensor[start:start+self.block_size] for start in range(self.curr_pos+1,self.curr_pos+self.batch_size+1)]
+        target_data = torch.stack(target_data)
+
+        block_pos_list = [self.curr_pos // self.block_size] * self.batch_size
+
+        self.curr_pos += self.block_size
+        
+        if(self.curr_pos + self.batch_size + 1 > self.data_len):
+            self.curr_pos = (self.curr_pos % self.block_size) + 1
+
+        self.curr_loop += 1
+
+        #PERF we can use pin memory and async transfer here I guess
+        return (block_pos_list, input_data.to(self.device), target_data.to(self.device))
+
 
 class SingleRandomWorkLoader():
     """
@@ -372,10 +424,6 @@ def init_argparse() -> argparse.ArgumentParser:
     train_parser = command_subparsers.add_parser("train", help="Train a new or existing model", parents=[shared_parser])
 
     train_model_subparsers = train_parser.add_subparsers(dest="model", help="Available models")
-    train_data_group = train_parser.add_mutually_exclusive_group(required=True)
-    train_data_group.add_argument('--dir_tree',help='directory tree to look for zipped text files for training')
-    train_data_group.add_argument('--single_train_file',help='single zipped file of training data. Don\'t make this too big, it\'s loaded into memory all at once.')
-
     train_shared_parser = argparse.ArgumentParser(add_help=False)
     train_shared_parser.add_argument('--batch_size', nargs='?', type=int,default=64,help='num of batches to process at once')
     train_shared_parser.add_argument('--n_loops', nargs='?', type=int,default=100,help='number of times to loop through data')
@@ -395,6 +443,10 @@ def init_argparse() -> argparse.ArgumentParser:
     train_shared_parser.add_argument('--log_config_file', nargs='?',default='logging.conf',help='log config file, see: https://docs.python.org/3/howto/logging.html#configuring-logging')
 
     gpt_train_parser = train_model_subparsers.add_parser("gpt", help="GPT transformer model with memory", parents=[train_shared_parser])
+    gpt_train_data_group = gpt_train_parser.add_mutually_exclusive_group(required=True)
+    gpt_train_data_group.add_argument('--dir_tree',help='directory tree to look for zipped text files for training')
+    gpt_train_data_group.add_argument('--single_train_file',help='single zipped file of training data. Don\'t make this too big, it\'s loaded into memory all at once.')
+
     gpt_train_parser.add_argument('--block_size', nargs='?', type=int,default=256,help='block size in tokens.')
     gpt_train_parser.add_argument('--n_head', nargs='?', type=int,default=6,help='number of heads per layer')
     gpt_train_parser.add_argument('--n_embd', nargs='?', type=int,default=384,help='number of embedding dimensions')
@@ -411,6 +463,9 @@ def init_argparse() -> argparse.ArgumentParser:
     gpt_train_parser.add_argument('--beta2', nargs='?',type=float,default=0.95,help='AdamW parameter to control running average for momentum')
     
     smm_train_parser = train_model_subparsers.add_parser("smm", help="Simple classic deep learning model with memory", parents=[train_shared_parser])
+    smm_train_data_group = smm_train_parser.add_mutually_exclusive_group(required=True)
+    smm_train_data_group.add_argument('--dir_tree',help='directory tree to look for zipped text files for training')
+    smm_train_data_group.add_argument('--single_train_file',help='single zipped file of training data. Don\'t make this too big, it\'s loaded into memory all at once.')
     smm_train_parser.add_argument('--block_size', nargs='?', type=int,default=1,help='block size in tokens.')
     smm_train_parser.add_argument('--n_embd', nargs='?', type=int,default=64,help='number of embedding dimensions')
     smm_train_parser.add_argument('--n_memory', nargs='?', type=int,default=64,help='number of memory values to store across cycles')
@@ -418,18 +473,13 @@ def init_argparse() -> argparse.ArgumentParser:
     smm_train_parser.add_argument('--n_inner_pred_size', nargs='?', type=int,default=64,help='the base number of nodes in the predicition hidden layer. actual number of nodes is this x n_embd x n_inp_window')
     smm_train_parser.add_argument('--jac_grad_decay', nargs='?',type=float,default=0.03,help='Amount to decay the effect of the previous cycles grads on the current learning step. From 0.0 to 1.0')
     
-    imagine_parser = command_subparsers.add_parser("imagine", help="Imagine the rest of a story", parents=[shared_parser])
-    imagine_parser.add_argument('--perc', nargs='?', type=float,default=0.5,help='amount of story to read before starting to imagine the rest')
-    imagine_parser.add_argument('--load_model', required=True, help='load a previously generated model')
-    imagine_parser.add_argument('--zip_file', required=True, help='zipped txt file containing story')
-
-    # gpt_mm_train_parser = train_model_subparsers.add_parser("gpt_mm", help="gpt model with tacked on simple neural net to control memory", parents=[train_shared_parser])
-    # smm_train_parser.add_argument('--block_size', nargs='?', type=int,default=1,help='block size in tokens.')
-    # smm_train_parser.add_argument('--n_embd', nargs='?', type=int,default=64,help='number of embedding dimensions')
-    # smm_train_parser.add_argument('--n_memory', nargs='?', type=int,default=64,help='number of memory values to store across cycles')
-    # smm_train_parser.add_argument('--n_inner_mem_size', nargs='?', type=int,default=64,help='the base number of nodes in the memory hidden layer. actual number of nodes is this x n_embd x n_inp_window')
-    # smm_train_parser.add_argument('--n_inner_pred_size', nargs='?', type=int,default=64,help='the base number of nodes in the predicition hidden layer. actual number of nodes is this x n_embd x n_inp_window')
-    # smm_train_parser.add_argument('--jac_grad_decay', nargs='?',type=float,default=0.03,help='Amount to decay the effect of the previous cycles grads on the current learning step. From 0.0 to 1.0')
+    om_train_parser = train_model_subparsers.add_parser("om", help="gpt model with tacked on simple neural net to control memory. The gpt model should already be fully trained. Only the memory is trainable", parents=[train_shared_parser])
+    om_train_parser.add_argument('--checkpoint_path',required=True,help='directory containing checkpoint of already trained nanoGPT model')
+    om_train_parser.add_argument('--data_dir',required=True,help='directory containing train.bin and val.bin')
+    om_train_parser.add_argument('--n_memory', nargs='?', type=int,default=8,help='number of memory values to store across cycles')
+    om_train_parser.add_argument('--n_inner_mem_size', nargs='?', type=int,default=8,help='the base number of nodes in the memory hidden layer. actual number of nodes is this x n_embd x n_inp_window')
+    om_train_parser.add_argument('--n_inner_pred_size', nargs='?', type=int,default=8,help='the base number of nodes in the predicition hidden layer. actual number of nodes is this x n_embd x n_inp_window')
+    om_train_parser.add_argument('--jac_grad_decay', nargs='?',type=float,default=0.03,help='Amount to decay the effect of the previous cycles grads on the current learning step. From 0.0 to 1.0')
     
     imagine_parser = command_subparsers.add_parser("imagine", help="Imagine the rest of a story", parents=[shared_parser])
     imagine_parser.add_argument('--perc', nargs='?', type=float,default=0.5,help='amount of story to read before starting to imagine the rest')
@@ -527,65 +577,75 @@ def create_smm_model_state(enc,parser,config):
 
     return ModelState(m,wl,test_wl,optimizer,config,get_stats)
 
-def create_gpt_mm_model_state(enc,parser,config):
+class ChangeViewModel(nn.Module):
+    def __init__(self,new_size):
+        super().__init__()
+        self.new_size = new_size
 
-    #max_token_value is one less than the vocab size as far as I can tell, see:
-    #https://github.com/openai/tiktoken/blob/7830ed537badecefb5a357448be722bfd58f9fca/tiktoken/core.py
-    gptconf = mm2.GPTConfig(block_size=config.mem_size+config.block_size,vocab_size=config.vocab_size,n_layer=config.n_layer,
-                            n_head=config.n_head,n_mem_embd=config.n_mem_embd,
-                            n_embd=config.n_embd,dropout=config.dropout,bias=not config.no_bias,
-                            batch_size=config.batch_size,n_memory_per_layer=config.n_memory_per_layer,
-                            jac_grad_decay=config.jac_grad_decay,
-                            no_flash=config.no_flash,
-                            mem_grad_multiplier=config.mem_grad_multiplier,
-                            device=config.device
-                            )
-    pred_model = mm.GPT(gptconf)
+    def forward(self,x):
+        return x.view(x.shape[0],*self.new_size)
 
-    if config.dir_tree is None:
-        parser.error("--dir_tree is required when --random_batches is false.")
-    wl = WorkLoader(enc,{},create_files_iter_fn(config.dir_tree),config.batch_size,config.block_size,config.n_loops,config.device,config.pre_start_token,config.post_end_token,config.min_text_size,config.max_text_size,update_global_stats=True)
+def create_om_model_state(enc,parser,config):
+    """
+    This creates an original nanoGPT model that is supposed to be pretrained. We are
+    only training the memory.
+    """
 
-    #TODO fixme for mem model, we need it to cover mem model
-    optimizer = mm2.configure_optimizers(config.weight_decay, config.learning_rate, (config.beta1, config.beta2), config.device)
+    #orignally from nanoGPT's sample.py
+    ckpt_path = config.checkpoint_path
+    checkpoint = torch.load(ckpt_path, map_location=config.device)
+    gptconf = om.GPTConfig(**checkpoint['model_args'],device=config.device)
+    pred_model = om.GPT(gptconf)
+    state_dict = checkpoint['model']
+    unwanted_prefix = '_orig_mod.'
+    for k,v in list(state_dict.items()):
+        if k.startswith(unwanted_prefix):
+            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+    pred_model.load_state_dict(state_dict)
 
-    n_mem_inp = config.n_memory + config.block_size * config.n_embd
+    train_data = torch.from_numpy(np.memmap(os.path.join(config.data_dir, 'train.bin'), dtype=np.uint16, mode='r').astype(np.int64))
+
+    val_data = torch.from_numpy(np.memmap(os.path.join(config.data_dir, 'val.bin'), dtype=np.uint16, mode='r').astype(np.int64))
+
+    wl = SingleSequentialWorkLoader(train_data,config.batch_size,gptconf.block_size,config.n_loops,config.device)
+
+    n_mem_inp = (gptconf.n_embd * config.n_memory # this is the memory itself
+                 + gptconf.block_size * gptconf.vocab_size #this is the model output
+                 )
     n_mem_hidden = config.n_inner_mem_size
 
-    mem_model = nn.Sequential(
+    mem_model = jm.JacSequential(
+        ChangeViewModel((-1,)),
         jm.JacLinear(n_mem_inp, n_mem_hidden,device=config.device),
         nn.ReLU(),
         jm.JacLinear(n_mem_hidden, n_mem_hidden,device=config.device),
         nn.ReLU(),
-        jm.JacLinear(n_mem_hidden, config.n_memory,device=config.device),
-        nn.Sigmoid())
+        jm.JacLinear(n_mem_hidden, config.n_memory* gptconf.n_embd,device=config.device),
+        nn.Sigmoid(),
+        ChangeViewModel((config.n_memory,gptconf.n_embd)))
+
+    optimizer = torch.optim.AdamW(mem_model.parameters())
 
     pmm_config = pmm.PMMConfig(batch_size=config.batch_size,
                                n_memory = config.n_memory,
-                               vocab_size=config.vocab_size,
-                               block_size=config.block_size,
+                               n_embd = gptconf.n_embd,
                                jac_grad_decay= config.jac_grad_decay,
                                device=config.device)
 
     m = pmm.PluginMemModel(pmm_config,mem_model,pred_model)
 
-    if(config.test_dir_tree is not None):
-        #TODO 3 HACK we are limiting the batch size to 1 for testing, since if there
-        #aren't enough files to fill all the batches then WorkLoader will return empty
-        #batch items for the missing ones which can really screw up the estimated loss
-        test_wl = WorkLoader(enc,{},create_files_iter_fn(config.test_dir_tree),1,config.block_size,1,config.device,config.pre_start_token,config.post_end_token,config.min_text_size,config.max_text_size,update_global_stats=False)
-    else:
-        test_wl = None
+    test_wl = SingleSequentialWorkLoader(val_data,config.batch_size,gptconf.block_size,1,config.device)
 
     def get_stats(ms):
-        memory_vec_lengths = [torch.norm(b.memory).item() for b in ms.mdl.transformer.h],
-        avg_memory_vec_length = sum(memory_vec_lengths)/len(memory_vec_lengths)
+        #TODO 1.5 real stats please!
+        # memory_vec_lengths = [torch.norm(b.memory).item() for b in ms.mdl.pred_model.transformer.h],
+        # avg_memory_vec_length = sum(memory_vec_lengths)/len(memory_vec_lengths)
 
-        return {
-            'mem_avg_grad': u.get_avg_abs_grad(ms.mdl.get_mem_params()),
-            'out_avg_grad': u.get_avg_abs_grad(ms.mdl.get_out_params()),
-            'memory_vec_lengths': memory_vec_lengths,
-            'avg_memory_vec_length': avg_memory_vec_length}
+        return {}
+            # 'mem_avg_grad': u.get_avg_abs_grad(ms.mdl.get_mem_params()),
+            # 'out_avg_grad': u.get_avg_abs_grad(ms.mdl.get_out_params()),
+            # 'memory_vec_lengths': memory_vec_lengths,
+            # 'avg_memory_vec_length': avg_memory_vec_length}
 
     return ModelState(m,wl,test_wl,optimizer,config,get_stats)
 
@@ -743,6 +803,7 @@ def run_training(config,enc,ms):
                 est_loss(ms,config)
                 stats.last_est_loss_time = time.time()
 
+
 def main():
     global stats
 
@@ -761,8 +822,10 @@ def main():
             ms = create_model_state(enc,parser,config)
         elif(config.model == 'smm'):
             ms = create_smm_model_state(enc,parser,config)
+        elif(config.model == 'om'):
+            ms = create_om_model_state(enc,parser,config)
         else:
-            ms = create_gpt_smm_model_state(enc,parser,confgi)
+            assert(False) #what model is this?
 
     print(sum(p.numel() for p in ms.mdl.parameters())/1e6, 'M parameters')
     if(config.bos):

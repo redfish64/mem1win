@@ -7,7 +7,7 @@ import pdb
 import util as u
 import itertools
 
-def jac_grad(module, inp_batch, batch_indexed_grad_jac_params, repeated_grad_jac_params, batch_indexed_params, *extra_module_args, vmap_randomness='error', **extra_module_kwargs):
+def jac_grad(module, inp_batch, batch_indexed_grad_jac_params, repeated_grad_jac_params, batch_indexed_params, *extra_module_args, vmap_randomness='different', **extra_module_kwargs):
     """
     Runs the module against the input batch and returns the output. The jacobian is placed into the individual
     selected parameters, as `<param>.jac_grad`
@@ -185,8 +185,30 @@ class Snake(object):
             else:
                 jp.grad += running_portion_grad
 
+class JacSequential(nn.Module):
+    def __init__(self, *models):
+        super().__init__()
+        self.models = models
 
+        for i, m in enumerate(models):
+            self.add_module(f'#{i}',m)
 
+    def get_jac_params(self):
+        def my_get_jac_params(m):
+            if(next(m.parameters(),None) is None):
+                return iter([])
+            return m.get_jac_params()
+
+        res = (item for iterator in [my_get_jac_params(m) for m in self.models] for item in iterator)
+        
+        return res  
+
+    def forward(self,x):
+        for m in self.models:
+            x = m(x)
+
+        return x
+    
 class JacLinear(nn.Module):
     def __init__(self, n_in, n_out, requires_grad=True, has_bias=True,device='cpu'):
         super().__init__()
